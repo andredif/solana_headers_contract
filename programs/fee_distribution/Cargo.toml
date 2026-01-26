@@ -1,0 +1,12 @@
+[package]
+name = "fee_distribution"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang = "0.29.0"
+anchor-spl = "0.29.0"
+spl-token = "4"
+
+[lib]
+crate-type = ["cdylib", "lib"]
