@@ -64,11 +64,40 @@ anchor build
 anchor test
 ```
 
-## Deployment
+## Deployment & Testing
+
+### Quick Start
+
+1. **Set up Python environment:**
+   ```bash
+   source venv/bin/activate
+   ```
+
+2. **Deploy to testnet:**
+   ```bash
+   python deploy.py ~/.config/solana/id.json testnet
+   ```
+
+3. **Run integration tests:**
+   ```bash
+   pytest tests/integration_tests.py -v
+   ```
+
+### Detailed Documentation
+
+See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for comprehensive deployment and testing instructions.
+
+### Supported Networks
+
+- **Devnet** - Fast development network (SOL resets frequently)
+- **Testnet** - Stable testing network (recommended)
+- **Mainnet** - Production network (uses real SOL)
 
 ```bash
-# Deploy to mainnet
-anchor deploy --provider.cluster mainnet
+# Deploy to different networks
+python deploy.py ~/.config/solana/id.json devnet      # Development
+python deploy.py ~/.config/solana/id.json testnet     # Testing
+python deploy.py ~/.config/solana/id.json mainnet-beta # Production
 ```
 
 ## Account Structure

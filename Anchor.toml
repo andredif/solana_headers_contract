@@ -1,0 +1,24 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+fee_distribution = "11111111111111111111111111111111"
+
+[programs.mainnet]
+fee_distribution = "11111111111111111111111111111111"
+
+[programs.testnet]
+fee_distribution = "7Wae1NEJ9RJY7oLJaSp5LopFC5Kr2T1e6P16hD3MQfBw"
+
+[registry]
+url = "https://api.github.com/repos/coral-xyz/anchor/releases/download"
+
+[provider]
+cluster = "testnet"
+wallet = "./id.json"
+
+[scripts]
+test = "yarn run ts-mocha --require ts-node/register tests/**/*.ts"

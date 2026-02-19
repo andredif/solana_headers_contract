@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Transfer};
 use anchor_spl::token::TokenAccount;
 
-declare_id!("11111111111111111111111111111111");
+declare_id!("7Wae1NEJ9RJY7oLJaSp5LopFC5Kr2T1e6P16hD3MQfBw");
 
 #[program]
 pub mod fee_distribution {
@@ -152,7 +152,7 @@ pub struct RentSpace<'info> {
         init,
         payer = payer,
         space = 8 + std::mem::size_of::<FeeRecord>(),
-        seeds = [b"fee_record", payer.key().as_ref(), &[ctx.accounts.payer.to_account_info().lamports() as u8]],
+        seeds = [b"fee_record", payer.key().as_ref()],
         bump
     )]
     pub fee_record: Account<'info, FeeRecord>,
