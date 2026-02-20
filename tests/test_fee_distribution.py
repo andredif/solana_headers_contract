@@ -12,7 +12,6 @@ import struct
 from typing import Tuple
 
 from anchorpy import Program, Provider, Wallet, Context, Idl
-from anchorpy.pytest_plugin import workspace_fixture
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
@@ -23,8 +22,7 @@ from spl.token.async_client import AsyncToken
 from spl.token.constants import TOKEN_PROGRAM_ID
 from spl.token.instructions import (
     create_associated_token_account,
-    get_associated_token_address,
-)
+    get_associated_token_address,)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -35,9 +33,6 @@ EXPECTED_FEE       = 200   # 20%
 EXPECTED_RECIPIENT = 800   # 80%
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
-
-workspace = workspace_fixture(".", build_cmd="anchor build")
-
 
 @pytest.fixture(scope="module")
 def event_loop():
