@@ -1,5 +1,5 @@
 [toolchain]
-anchor_version = "0.30.1"
+anchor_version = "0.32.1"
 
 [features]
 resolution = true
@@ -12,7 +12,7 @@ fee_distribution = "11111111111111111111111111111111"
 fee_distribution = "11111111111111111111111111111111"
 
 [programs.testnet]
-fee_distribution = "7Wae1NEJ9RJY7oLJaSp5LopFC5Kr2T1e6P16hD3MQfBw"
+fee_distribution = "CkM4AcKu7LSXikXaTvxwuTDBXmT2yrEZTvXbJ6Kdrox7"
 
 [registry]
 url = "https://api.github.com/repos/coral-xyz/anchor/releases/download"
