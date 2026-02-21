@@ -37,6 +37,13 @@ coverage.xml
 htmlcov/
 .tox/
 .hypothesis/
+**/rocksdb/
+**/snapshots/
+
+# Local test-ledger (exclude all except .json files)
+test-ledger/*
+!test-ledger/*.json
+!test-ledger/**/*.json
 
 # Environment variables
 .env

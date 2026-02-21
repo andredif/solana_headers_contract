@@ -12,7 +12,7 @@ fee_distribution = "11111111111111111111111111111111"
 fee_distribution = "11111111111111111111111111111111"
 
 [programs.testnet]
-fee_distribution = "CkM4AcKu7LSXikXaTvxwuTDBXmT2yrEZTvXbJ6Kdrox7"
+fee_distribution = "6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm"
 
 [registry]
 url = "https://api.github.com/repos/coral-xyz/anchor/releases/download"

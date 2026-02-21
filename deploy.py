@@ -9,7 +9,7 @@ Usage: python deploy.py <path_to_keypair> [network]
 
 Arguments:
     path_to_keypair: Path to Solana keypair JSON file (required)
-    network: Solana network (devnet, testnet, mainnet-beta) - default: testnet
+    network: Solana network (devnet, testnet, mainnet-beta, localnet) - default: testnet
 """
 
 import json
@@ -29,6 +29,7 @@ def get_rpc_url(network: str) -> str:
         "devnet": "https://api.devnet.solana.com",
         "testnet": "https://api.testnet.solana.com",
         "mainnet-beta": "https://api.mainnet-beta.solana.com",
+        "localnet": "http://127.0.0.1:8899"
     }
     return rpc_urls.get(network, rpc_urls["testnet"])
 
@@ -55,7 +56,7 @@ def load_keypair(keypair_path: str) -> Keypair:
 
 def validate_network(network: str) -> str:
     """Validate network parameter."""
-    valid_networks = ["devnet", "testnet", "mainnet-beta"]
+    valid_networks = ["devnet", "testnet", "mainnet-beta", "localnet"]
     if network not in valid_networks:
         print(f"✗ Invalid network: {network}")
         print(f"  Valid options: {', '.join(valid_networks)}")
@@ -124,7 +125,7 @@ def read_program_idl(project_path: str = "/home/andrea/Desktop/solana_contract")
         return None
 
 
-def read_program_binary(project_path: str = "/home/andrea/Desktop/solana_contract") -> Optional[bytes]:
+def read_program_binary(project_path: str = "/home/andrea/Desktop/solana_h_contract/solana_headers_contract") -> Optional[bytes]:
     """Read the compiled program binary."""
     try:
         # Try to find the .so file in the target directory
@@ -241,11 +242,12 @@ def main():
         print("Usage: python deploy.py <path_to_keypair> [network] [--get-latest-build]")
         print("\nArguments:")
         print("  path_to_keypair     Path to Solana keypair JSON file (required)")
-        print("  network             Network: devnet, testnet, mainnet-beta (default: testnet)")
+        print("  network             Network: devnet, testnet, mainnet-beta, localnet (default: testnet)")
         print("  --get-latest-build  Use latest build from target/ instead of rebuilding")
         print("\nExamples:")
         print("  python deploy.py ./id.json testnet")
         print("  python deploy.py ./id.json devnet --get-latest-build")
+        print("  python deploy.py ./id.json localnet")
         sys.exit(1)
     
     # Parse positional arguments and flags
@@ -264,7 +266,7 @@ def main():
     # Validate inputs
     keypair_path = os.path.expanduser(keypair_path)
     network = validate_network(network)
-    project_path = "/home/andrea/Desktop/solana_contract"
+    project_path = "/home/andrea/Desktop/solana_h_contract/solana_headers_contract"
     
     print("=" * 60)
     print("Solana Fee Distribution Contract Deployment")

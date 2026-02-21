@@ -3,17 +3,7 @@ use anchor_spl::token::{self, Transfer, Token};
 use anchor_spl::token::TokenAccount;
 use anchor_spl::token::Mint;
 
-declare_id!("CkM4AcKu7LSXikXaTvxwuTDBXmT2yrEZTvXbJ6Kdrox7");
-
-const PRECISION: u128 = 1_000_000_000_000;
-
-// Hardcoded space constants (8 = Anchor discriminator)
-// ContractState: 32 + 32 + 1 + 1 + 16 + 8 + 8 + 8 = 106
-const CONTRACT_STATE_SPACE: usize = 8 + 106;
-// FeeRecord: 32 + 32 + 32 + 8 + 8 + 8 + 8 + 8 = 136
-const FEE_RECORD_SPACE: usize = 8 + 136;
-// HolderState: 32 + 16 + 8 = 56
-const HOLDER_STATE_SPACE: usize = 8 + 56;
+declare_id!("6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm");
 
 const PRECISION: u128 = 1_000_000_000_000;
 
