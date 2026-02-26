@@ -60,13 +60,18 @@ class TransactionResult:
 class ContractInteractor:
     """Helper class for interacting with the Fee Distribution contract."""
     
-    # Anchor instruction discriminators (first 8 bytes of sighash)
-    DISCRIMINATOR_INITIALIZE = b'\xaf\xaf\x6c\xa7\xb8\x49\xb0\x1e'
-    DISCRIMINATOR_UPDATE_SUPPLY = b'\x5d\xf3\xec\x16\x06\x8f\x69\xe1'
-    DISCRIMINATOR_RENT_SPACE = b'\x5a\x79\x67\x3e\x7a\x93\x51\xab'
-    DISCRIMINATOR_INIT_HOLDER = b'\x2b\xd5\x8e\x8a\xdc\xb1\x2c\xca'
-    DISCRIMINATOR_CLAIM_FEES = b'\xf5\x5c\x82\xc0\xef\xba\x8b\x77'
-    DISCRIMINATOR_UPDATE_OWNER = b'\x9e\xa4\xfd\x75\x90\x7a\xdf\xf8'
+    # Anchor instruction discriminators — sha256("global:{name}")[:8]
+    DISCRIMINATOR_INITIALIZE          = b'\xaf\xaf\x6d\x1f\x0d\x98\x9b\xed'
+    DISCRIMINATOR_UPDATE_SUPPLY       = b'\x5c\x13\xad\x98\xcd\xf6\xeb\xd1'
+    DISCRIMINATOR_RENT_SPACE          = b'\x99\xe2\xcc\x02\xbb\x12\x0e\xcd'
+    DISCRIMINATOR_INIT_HOLDER         = b'\x9d\x8e\xa5\x7e\x99\xf8\xa1\x34'
+    DISCRIMINATOR_CLAIM_FEES          = b'\x52\xfb\xe9\x9c\x0c\x34\xb8\xca'
+    DISCRIMINATOR_UPDATE_OWNER        = b'\xa4\xbc\x7c\xfe\x84\x1a\xc6\xb2'
+    DISCRIMINATOR_FINALIZE_RENT       = b'\x61\x3d\xf2\xad\x9d\x0d\xc2\xcf'
+    DISCRIMINATOR_REVERT_RENT         = b'\xc2\x28\x71\xf8\x67\x2f\xa9\xcf'
+    DISCRIMINATOR_CLAIM_OWNER_FEE     = b'\x24\x2c\xb7\xd0\x7a\x63\x22\x89'
+    DISCRIMINATOR_REVOKE_BY_ORACLE    = b'\x63\x3b\x94\xf4\xec\x3d\x0c\x99'
+    DISCRIMINATOR_UPDATE_ORACLE       = b'\x70\x29\xd1\x12\xf8\xe2\xfc\xbc'
     
     # Constants
     PRECISION = 1_000_000_000_000
@@ -184,41 +189,43 @@ class ContractInteractor:
     def create_initialize_instruction(
         self,
         owner: Pubkey,
+        oracle: Pubkey,
         governance_token_mint: Pubkey,
         payer: Pubkey,
         supply_snapshot: int = 1_000_000_000_000_000
     ) -> Instruction:
         """
         Create instruction for contract initialization.
-        
+
         Args:
-            owner: Owner pubkey
+            owner: Owner pubkey (kept offline, safe)
+            oracle: Oracle pubkey (used by backend to call revoke_by_oracle)
             governance_token_mint: Governance token mint
             payer: Transaction payer
             supply_snapshot: Supply snapshot at initialization time
-        
+
         Returns:
             Instruction for initialize
         """
         contract_pubkey, _ = self.get_contract_pda()
         fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
-        
-        # Encode instruction data: discriminator + owner + supply_snapshot
-        instruction_data = self.DISCRIMINATOR_INITIALIZE
+
+        # discriminator + owner (32) + oracle (32) + supply_snapshot (8)
+        instruction_data  = self.DISCRIMINATOR_INITIALIZE
         instruction_data += bytes(owner)
+        instruction_data += bytes(oracle)
         instruction_data += supply_snapshot.to_bytes(8, byteorder='little')
-        
-        # Build account metas in order
+
         accounts = [
-            AccountMeta(pubkey=contract_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=contract_pubkey,       is_signer=False, is_writable=True),
             AccountMeta(pubkey=governance_token_mint, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=fee_vault_pubkey, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_vault_pubkey,      is_signer=False, is_writable=True),
+            AccountMeta(pubkey=payer,                 is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM),  is_signer=False, is_writable=False),
             AccountMeta(pubkey=Pubkey.from_string(self.SYSTEM_PROGRAM), is_signer=False, is_writable=False),
-            AccountMeta(pubkey=RENT, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=RENT,                  is_signer=False, is_writable=False),
         ]
-        
+
         return Instruction(
             program_id=self.program_id,
             accounts=accounts,
@@ -389,24 +396,215 @@ class ContractInteractor:
     ) -> Instruction:
         """
         Create instruction to update contract owner (owner only).
-        
+
         Args:
             new_owner: New owner pubkey
             current_owner: Current owner signer pubkey
-        
+
         Returns:
             Instruction for update_owner
         """
         contract_pubkey, _ = self.get_contract_pda()
-        
-        instruction_data = self.DISCRIMINATOR_UPDATE_OWNER
+
+        instruction_data  = self.DISCRIMINATOR_UPDATE_OWNER
         instruction_data += bytes(new_owner)
-        
+
         accounts = [
             AccountMeta(pubkey=contract_pubkey, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=current_owner, is_signer=True, is_writable=False),
+            AccountMeta(pubkey=current_owner,   is_signer=True,  is_writable=False),
         ]
-        
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=instruction_data
+        )
+
+    def create_update_oracle_instruction(
+        self,
+        new_oracle: Pubkey,
+        current_owner: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction to rotate the oracle keypair (owner only).
+
+        Args:
+            new_oracle: New oracle pubkey
+            current_owner: Current owner signer pubkey
+
+        Returns:
+            Instruction for update_oracle
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+
+        instruction_data  = self.DISCRIMINATOR_UPDATE_ORACLE
+        instruction_data += bytes(new_oracle)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=current_owner,   is_signer=True,  is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=instruction_data
+        )
+
+    def create_finalize_rent_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        caller: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction to finalize a rent after expiry.
+        Permissionless — anyone can be the caller.
+
+        Args:
+            payer: Original payer whose fee record we are finalizing
+            fee_record_index: Index of the fee record
+            caller: Transaction signer (any pubkey)
+
+        Returns:
+            Instruction for finalize_rent
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,   is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_vault_pubkey,  is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=caller,            is_signer=True,  is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=self.DISCRIMINATOR_FINALIZE_RENT
+        )
+
+    def create_revert_rent_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        authority: Pubkey,
+        payer_token_account: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction to revert a rent (loaner or owner only).
+        Returns governance + owner fees to the loaner.
+
+        Args:
+            payer: Original payer (loaner) pubkey
+            fee_record_index: Index of the fee record
+            authority: Signer — must be payer or contract owner
+            payer_token_account: Loaner's token account that receives the refund
+
+        Returns:
+            Instruction for revert_rent
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,      is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_vault_pubkey,     is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey,    is_signer=False, is_writable=True),
+            AccountMeta(pubkey=authority,            is_signer=True,  is_writable=False),
+            AccountMeta(pubkey=payer_token_account,  is_signer=False, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=self.DISCRIMINATOR_REVERT_RENT
+        )
+
+    def create_claim_owner_fee_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        owner: Pubkey,
+        owner_token_account: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction for the contract owner to claim their 5 % fee
+        from a finalized rental record.
+
+        Args:
+            payer: Original payer pubkey (used for fee record PDA derivation)
+            fee_record_index: Index of the fee record
+            owner: Contract owner signer
+            owner_token_account: Owner's token account that receives the fee
+
+        Returns:
+            Instruction for claim_owner_fee
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,     is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_vault_pubkey,    is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey,   is_signer=False, is_writable=True),
+            AccountMeta(pubkey=owner,               is_signer=True,  is_writable=False),
+            AccountMeta(pubkey=owner_token_account, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=self.DISCRIMINATOR_CLAIM_OWNER_FEE
+        )
+
+    def create_revoke_by_oracle_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        oracle: Pubkey,
+        payer_token_account: Pubkey,
+        reason: str
+    ) -> Instruction:
+        """
+        Create instruction for the oracle to revoke a rent (violation detected).
+        The full locked fee (governance + owner) is refunded to the loaner.
+
+        Args:
+            payer: Original payer (loaner) pubkey
+            fee_record_index: Index of the fee record
+            oracle: Oracle backend signer
+            payer_token_account: Loaner's token account that receives the refund
+            reason: Human-readable reason string logged on-chain (e.g. "header_image_changed")
+
+        Returns:
+            Instruction for revoke_by_oracle
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        # Borsh-encode the reason string: u32 length prefix + UTF-8 bytes
+        reason_bytes = reason.encode('utf-8')
+        instruction_data  = self.DISCRIMINATOR_REVOKE_BY_ORACLE
+        instruction_data += len(reason_bytes).to_bytes(4, byteorder='little')
+        instruction_data += reason_bytes
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,     is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_vault_pubkey,    is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey,   is_signer=False, is_writable=True),
+            AccountMeta(pubkey=oracle,              is_signer=True,  is_writable=False),
+            AccountMeta(pubkey=payer_token_account, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+        ]
+
         return Instruction(
             program_id=self.program_id,
             accounts=accounts,
@@ -418,32 +616,38 @@ class ContractInteractor:
     def get_contract_state(self) -> Optional[Dict[str, Any]]:
         """
         Get current contract state from chain.
-        
-        Returns:
-            Dictionary containing contract state fields or None if not found
+
+        ContractState borsh layout (after 8-byte discriminator):
+          owner                    [0:32]
+          governance_token_mint   [32:64]
+          oracle                  [64:96]   ← new
+          bump                    [96]
+          fee_vault_bump          [97]
+          fees_per_token_accumulated [98:114]  (u128)
+          total_fees_accumulated  [114:122] (u64)
+          fee_record_count        [122:130] (u64)
+          supply_snapshot         [130:138] (u64)
         """
         try:
             contract_pubkey, _ = self.get_contract_pda()
             account = self.get_account_info(contract_pubkey)
-            
-            if not account or len(account.data) < 114:
+
+            if not account or len(account.data) < 146:   # 8 discriminator + 138
                 return None
-            
-            # Parse contract state: skip 8-byte discriminator
+
             data = account.data[8:]
-            
-            result = {
-                'address': str(contract_pubkey),
-                'owner': str(Pubkey(data[0:32])),
-                'governance_token_mint': Pubkey(data[32:64]),
-                'bump': data[64],
-                'fee_vault_bump': data[65],
-                'fees_per_token_accumulated': int.from_bytes(data[66:82], byteorder='little'),
-                'total_fees_accumulated': int.from_bytes(data[82:90], byteorder='little'),
-                'fee_record_count': int.from_bytes(data[90:98], byteorder='little'),
-                'supply_snapshot': int.from_bytes(data[98:106], byteorder='little'),
+            return {
+                'address':                    str(contract_pubkey),
+                'owner':                      str(Pubkey(data[0:32])),
+                'governance_token_mint':      str(Pubkey(data[32:64])),
+                'oracle':                     str(Pubkey(data[64:96])),
+                'bump':                       data[96],
+                'fee_vault_bump':             data[97],
+                'fees_per_token_accumulated': int.from_bytes(data[98:114],  byteorder='little'),
+                'total_fees_accumulated':     int.from_bytes(data[114:122], byteorder='little'),
+                'fee_record_count':           int.from_bytes(data[122:130], byteorder='little'),
+                'supply_snapshot':            int.from_bytes(data[130:138], byteorder='little'),
             }
-            return result
         except Exception as e:
             raise RuntimeError(f"Failed to get contract state: {e}")
     
@@ -484,36 +688,44 @@ class ContractInteractor:
     ) -> Optional[Dict[str, Any]]:
         """
         Get fee record from chain.
-        
-        Args:
-            payer: Payer pubkey
-            index: Fee record index
-            
-        Returns:
-            Dictionary containing fee record fields or None if not found
+
+        FeeRecord borsh layout (after 8-byte discriminator):
+          contract          [0:32]
+          payer             [32:64]
+          recipient         [64:96]
+          expiration_time   [96:104]  (i64)
+          total_amount      [104:112] (u64)
+          governance_fee    [112:120] (u64)  — 15 %
+          owner_fee         [120:128] (u64)  —  5 %
+          timestamp         [128:136] (i64)
+          index             [136:144] (u64)
+          is_finalized      [144]     (bool)
+          is_reverted       [145]     (bool)
+          owner_fee_claimed [146]     (bool)
         """
         try:
             fee_record_pubkey, _ = self.get_fee_record_pda(payer, index)
             account = self.get_account_info(fee_record_pubkey)
-            
-            if not account or len(account.data) < 144:
+
+            if not account or len(account.data) < 155:  # 8 + 147
                 return None
-            
-            # Parse fee record: skip 8-byte discriminator
+
             data = account.data[8:]
-            
-            result = {
-                'address': str(fee_record_pubkey),
-                'contract': str(Pubkey(data[0:32])),
-                'payer': str(Pubkey(data[32:64])),
-                'recipient': str(Pubkey(data[64:96])),
-                'expiration_time': int.from_bytes(data[96:104], byteorder='little', signed=True),
-                'total_amount': int.from_bytes(data[104:112], byteorder='little'),
-                'fee_amount': int.from_bytes(data[112:120], byteorder='little'),
-                'timestamp': int.from_bytes(data[120:128], byteorder='little', signed=True),
-                'index': int.from_bytes(data[128:136], byteorder='little'),
+            return {
+                'address':          str(fee_record_pubkey),
+                'contract':         str(Pubkey(data[0:32])),
+                'payer':            str(Pubkey(data[32:64])),
+                'recipient':        str(Pubkey(data[64:96])),
+                'expiration_time':  int.from_bytes(data[96:104],  byteorder='little', signed=True),
+                'total_amount':     int.from_bytes(data[104:112], byteorder='little'),
+                'governance_fee':   int.from_bytes(data[112:120], byteorder='little'),
+                'owner_fee':        int.from_bytes(data[120:128], byteorder='little'),
+                'timestamp':        int.from_bytes(data[128:136], byteorder='little', signed=True),
+                'index':            int.from_bytes(data[136:144], byteorder='little'),
+                'is_finalized':     bool(data[144]),
+                'is_reverted':      bool(data[145]),
+                'owner_fee_claimed': bool(data[146]),
             }
-            return result
         except Exception as e:
             raise RuntimeError(f"Failed to get fee record: {e}")
     
@@ -586,19 +798,29 @@ class ContractInteractor:
         except Exception as e:
             raise RuntimeError(f"Failed to get transaction logs: {e}")
     
-    def calculate_fee(self, amount: int) -> Tuple[int, int]:
+    def calculate_fees(self, amount: int) -> Tuple[int, int, int]:
         """
-        Calculate 20% fee and 80% recipient amount.
-        
+        Calculate the 80/15/5 fee split.
+
         Args:
             amount: Total payment amount
-            
+
         Returns:
-            Tuple of (fee_amount, recipient_amount)
+            Tuple of (recipient_amount, governance_fee, owner_fee)
         """
-        fee = (amount * 20) // 100
-        recipient = amount - fee
-        return fee, recipient
+        governance_fee = (amount * 15) // 100
+        owner_fee      = (amount *  5) // 100
+        recipient      = amount - governance_fee - owner_fee
+        return recipient, governance_fee, owner_fee
+
+    def calculate_fee(self, amount: int) -> Tuple[int, int]:
+        """
+        Legacy helper: returns (total_vault_fee, recipient_amount).
+        Prefer calculate_fees() for the full 3-way split.
+        """
+        _, gov, own = self.calculate_fees(amount)
+        vault = gov + own
+        return vault, amount - vault
     
     def calculate_claimable_fees(
         self,
