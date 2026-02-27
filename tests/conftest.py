@@ -1,162 +1,240 @@
 """
-Pytest configuration and fixtures for contract testing
+Pytest configuration for localnet integration testing of the fee_distribution program.
 
-This module provides shared fixtures and configuration for all tests.
+Architecture
+------------
+_program_info  (session-scoped, sync)
+    • Runs ``anchor build`` once for the whole test session.
+    • Deploys the .so to the running local validator via ``solana program deploy``.
+    • Returns (Idl, program_id, wallet_bytes) — no async objects.
+
+workspace  (module-scoped, async)
+    • Runs inside the test module's event loop.
+    • Creates an AsyncClient, airdrops SOL to the payer wallet,
+      then yields {"fee_distribution": Program}.
+    • Closes the async client on teardown.
+
+Notes
+-----
+Anchor 0.30+ generates IDL v2 format.  anchorpy_core 0.2.0 still expects the
+older v1 format.  ``_convert_idl_v2_to_v1()`` bridges the gap.
 """
 
-import pytest
 import json
 import subprocess
-import os
 from pathlib import Path
-from solders.pubkey import Pubkey
-from anchorpy import Program, Provider, Wallet, Idl
+
+import pytest
+import pytest_asyncio
+from anchorpy import Idl, Program, Provider, Wallet
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
+from solders.keypair import Keypair
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+_ROOT        = Path(__file__).parent.parent
+_DEPLOY_KP   = _ROOT / "target" / "deploy" / "fee_distribution-keypair.json"
+_SO_FILE     = _ROOT / "target" / "deploy" / "fee_distribution.so"
+_IDL_FILE    = _ROOT / "target" / "idl"    / "fee_distribution.json"
+_WALLET_FILE = _ROOT / "id.json"
+_RPC_URL     = "http://localhost:8899"
 
 
-@pytest.fixture
-def owner_address():
-    """Fixture providing a test owner address"""
-    return Pubkey.from_string("11111111111111111111111111111112")
+# ══════════════════════════════════════════════════════════════════════════════
+#  IDL format converter (Anchor 0.30+ v2 → anchorpy_core v1)
+# ══════════════════════════════════════════════════════════════════════════════
 
+def _convert_idl_v2_to_v1(idl_v2: dict) -> dict:
+    """
+    Convert the Anchor 0.30+ IDL format (v2/spec 0.1.0) to the legacy v1
+    format that anchorpy_core 0.2.x understands.
 
-@pytest.fixture
-def governance_token_mint():
-    """Fixture providing a test governance token mint address"""
-    return Pubkey.from_string("11111111111111111111111111111113")
+    Key differences handled:
+    • Top-level ``address``/``metadata`` → ``version``/``name``
+    • Instruction accounts: ``writable``/``signer`` → ``isMut``/``isSigner``
+    • Account type definitions live in ``types``; rebuild ``accounts`` from them
+    • Event fields need a boolean ``index`` field
+    • Simple type ``"pubkey"`` → ``"publicKey"``
+    """
+    metadata      = idl_v2.get("metadata", {})
+    types_by_name = {t["name"]: t for t in idl_v2.get("types", [])}
+    account_names = {a["name"] for a in idl_v2.get("accounts", [])}
+    event_names   = {e["name"] for e in idl_v2.get("events",   [])}
 
+    def _ty(ty):
+        if isinstance(ty, str):
+            return "publicKey" if ty == "pubkey" else ty
+        if isinstance(ty, dict):
+            if "defined" in ty:
+                n = ty["defined"]
+                return {"defined": n["name"] if isinstance(n, dict) else n}
+            for key in ("vec", "option"):
+                if key in ty:
+                    return {key: _ty(ty[key])}
+            if "array" in ty:
+                return {"array": [_ty(ty["array"][0]), ty["array"][1]]}
+        return ty
 
-@pytest.fixture
-def test_recipient():
-    """Fixture providing a test recipient address"""
-    return Pubkey.from_string("11111111111111111111111111111114")
+    def _fields(fields):
+        return [{"name": f["name"], "type": _ty(f["type"])} for f in (fields or [])]
 
+    def _event_fields(fields):
+        return [{"name": f["name"], "type": _ty(f["type"]), "index": f.get("index", False)}
+                for f in (fields or [])]
 
-@pytest.fixture
-def test_payer():
-    """Fixture providing a test payer address"""
-    return Pubkey.from_string("11111111111111111111111111111115")
+    def _type_def(td):
+        ty   = td.get("type", {})
+        kind = ty.get("kind", "struct")
+        if kind == "struct":
+            return {"name": td["name"], "type": {"kind": "struct", "fields": _fields(ty.get("fields", []))}}
+        if kind == "enum":
+            return {"name": td["name"], "type": {"kind": "enum", "variants": ty.get("variants", [])}}
+        return {"name": td["name"], "type": ty}
 
+    def _acct_item(acc):
+        if "accounts" in acc:                              # nested group
+            return {"name": acc["name"], "accounts": [_acct_item(a) for a in acc["accounts"]]}
+        r = {
+            "name":     acc["name"],
+            "isMut":    acc.get("writable", False),
+            "isSigner": acc.get("signer",   False),
+        }
+        if acc.get("isOptional"): r["isOptional"] = True
+        if "docs" in acc:         r["docs"]       = acc["docs"]
+        return r
 
-@pytest.fixture
-def contract_config(owner_address, governance_token_mint):
-    """Fixture providing contract configuration"""
-    return {
-        "owner": owner_address,
-        "governance_token_mint": governance_token_mint,
+    def _instr(instr):
+        return {
+            "name": instr["name"],
+            **({"docs": instr["docs"]} if "docs" in instr else {}),
+            "accounts": [_acct_item(a) for a in instr.get("accounts", [])],
+            "args":     [{"name": a["name"], "type": _ty(a["type"])}
+                         for a in instr.get("args", [])],
+        }
+
+    old_accounts = [_type_def(types_by_name[n])
+                    for acc in idl_v2.get("accounts", [])
+                    for n in (acc["name"],)
+                    if n in types_by_name]
+
+    old_types    = [_type_def(t)
+                    for t in idl_v2.get("types", [])
+                    if t["name"] not in account_names and t["name"] not in event_names]
+
+    old_events   = [{"name": e["name"],
+                     "fields": _event_fields(types_by_name[e["name"]].get("type", {}).get("fields", []))}
+                    for e in idl_v2.get("events", [])
+                    if e["name"] in types_by_name]
+
+    result = {
+        "version":      metadata.get("version", "0.0.0"),
+        "name":         metadata.get("name",    "unknown"),
+        "instructions": [_instr(i) for i in idl_v2.get("instructions", [])],
+        "accounts":     old_accounts,
+        "types":        old_types,
+        "errors":       idl_v2.get("errors", []),
     }
+    if old_events:
+        result["events"] = old_events
+    return result
 
 
-@pytest.fixture
-def payment_data(test_recipient):
-    """Fixture providing test payment data"""
-    return {
-        "recipient": test_recipient,
-        "expiration_time": 1704067200,
-        "payment_amount": 1000000,  # 1 SOL in lamports
-    }
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  Session fixture — build & deploy (sync, runs once per test session)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.fixture(scope="session")
-def workspace():
-    """Custom workspace fixture that loads the Anchor program without xprocess dependency.
-    
-    This fixture builds the Anchor project and loads the IDL, returning a dictionary
-    with program names as keys and Program objects as values.
+def _program_info():
     """
-    # Get workspace root (parent of tests directory)
-    workspace_root = Path(__file__).parent.parent
-    
-    # Build the Anchor project
-    build_cmd = "anchor build"
-    try:
-        result = subprocess.run(
-            build_cmd,
-            shell=True,
-            cwd=workspace_root,
-            capture_output=True,
-            text=True,
-            timeout=300,
+    Build the Anchor program, deploy to localnet, and return
+    (Idl, program_id: Pubkey, wallet_bytes: bytes).
+    """
+
+    # ── 1. Build ──────────────────────────────────────────────────────────────
+    print("\n[setup] Running anchor build …")
+    build = subprocess.run(
+        ["anchor", "build"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if build.returncode != 0:
+        raise RuntimeError(
+            f"anchor build failed (exit {build.returncode}):\n"
+            f"STDOUT:{build.stdout}\nSTDERR:{build.stderr}"
         )
-        if result.returncode != 0:
-            print(f"Build stderr: {result.stderr}")
-            raise RuntimeError(f"Anchor build failed: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Anchor build timed out after 300 seconds")
-    except Exception as e:
-        raise RuntimeError(f"Failed to build Anchor project: {e}")
-    
-    # Load the IDL
-    idl_path = workspace_root / "target" / "idl" / "fee_distribution.json"
-    if not idl_path.exists():
-        raise FileNotFoundError(f"IDL not found at {idl_path}")
-    
-    with open(idl_path, "r") as f:
-        idl_dict = json.load(f)
-    
-    idl = Idl.from_json(idl_dict)
-    
-    # Create a workspace dictionary with programs
-    # This uses localnet by default
-    workspace_dict = {}
-    
-    # Get program ID from id.json
-    id_path = workspace_root / "id.json"
-    if id_path.exists():
-        with open(id_path, "r") as f:
-            program_id_str = json.load(f)
-            if isinstance(program_id_str, str):
-                program_id = Pubkey.from_string(program_id_str)
-            elif isinstance(program_id_str, list):
-                # It's a keypair array, extract the public key
-                from solders.keypair import Keypair
-                keypair = Keypair.from_secret_key(bytes(program_id_str))
-                program_id = keypair.pubkey()
-            else:
-                raise ValueError(f"Unexpected id.json format: {program_id_str}")
-    else:
-        raise FileNotFoundError(f"id.json not found at {id_path}")
-    
-    # Create provider and program for localnet
-    # Note: This assumes localnet is running or tests will need to mock it
+    print("[setup] Build OK.")
+
+    # ── 2. Program ID ─────────────────────────────────────────────────────────
+    with open(_DEPLOY_KP) as fh:
+        deploy_data = json.load(fh)
+    program_kp = Keypair.from_bytes(bytes(deploy_data))
+    program_id = program_kp.pubkey()
+    print(f"[setup] Program ID: {program_id}")
+
+    # ── 3. Deploy ─────────────────────────────────────────────────────────────
+    print("[setup] Deploying to localnet …")
+    deploy = subprocess.run(
+        [
+            "solana", "program", "deploy",
+            str(_SO_FILE),
+            "--program-id", str(_DEPLOY_KP),
+            "--url",         _RPC_URL,
+            "--keypair",     str(_WALLET_FILE),
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if deploy.returncode != 0:
+        raise RuntimeError(
+            f"solana program deploy failed (exit {deploy.returncode}):\n"
+            f"STDOUT:{deploy.stdout}\nSTDERR:{deploy.stderr}"
+        )
+    print(f"[setup] Deploy OK: {deploy.stdout.strip()}")
+
+    # ── 4. Load & convert IDL ─────────────────────────────────────────────────
+    idl_v2  = json.loads(_IDL_FILE.read_text())
+    idl_v1  = _convert_idl_v2_to_v1(idl_v2)
+    idl     = Idl.from_json(json.dumps(idl_v1))
+
+    # ── 5. Wallet bytes ───────────────────────────────────────────────────────
+    with open(_WALLET_FILE) as fh:
+        wallet_data = json.load(fh)
+    wallet_bytes = bytes(wallet_data)
+
+    return idl, program_id, wallet_bytes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Module fixture — Provider + Program (async, once per test module)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def workspace(_program_info):
+    """
+    Create an AsyncClient + Provider inside the test module's event loop,
+    airdrop SOL to the payer wallet, then yield {"fee_distribution": Program}.
+    Closes the client on teardown.
+    """
+    idl, program_id, wallet_bytes = _program_info
+
+    wallet_keypair = Keypair.from_bytes(wallet_bytes)
+    client = AsyncClient(_RPC_URL, commitment=Confirmed)
+
+    # Airdrop so there is plenty of SOL for all transactions in this module.
     try:
-        import asyncio
-        from anchorpy import Provider, Wallet
-        from solders.keypair import Keypair
-        
-        # Create a simple provider with default settings
-        # Tests can override this with their own provider if needed
-        provider = asyncio.run(_create_provider())
-        program = Program(idl, program_id, provider)
-        
-        workspace_dict["fee_distribution"] = program
-    except Exception as e:
-        # If we can't create the provider, at least return the program struct
-        # Tests might not need the actual provider connection
-        print(f"Warning: Could not create provider: {e}")
-        from anchorpy import Program
-        program = Program(idl, program_id, None)
-        workspace_dict["fee_distribution"] = program
-    
-    return workspace_dict
+        resp = await client.request_airdrop(wallet_keypair.pubkey(), 10_000_000_000)
+        await client.confirm_transaction(resp.value, commitment=Confirmed)
+        print(f"\n[workspace] Airdropped 10 SOL to {wallet_keypair.pubkey()}")
+    except Exception as exc:
+        print(f"\n[workspace] Airdrop skipped: {exc}")
 
+    provider = Provider(client, Wallet(wallet_keypair))
+    program  = Program(idl, program_id, provider)
 
-async def _create_provider():
-    """Helper to create an AsyncProvider for localnet."""
-    from anchorpy import Provider, Wallet
-    from solana.rpc.async_api import AsyncClient
-    from solders.keypair import Keypair
-    import os
-    
-    # Use localnet by default
-    endpoint = os.getenv("RPC_URL", "http://localhost:8899")
-    client = AsyncClient(endpoint)
-    
-    # Create a dummy wallet (tests should provide their own payer)
-    dummy_keypair = Keypair()
-    wallet = Wallet(dummy_keypair)
-    
-    provider = Provider(client, wallet)
-    return provider
+    yield {"fee_distribution": program}
 
+    await client.close()

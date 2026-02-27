@@ -5,6 +5,9 @@ anchor_version = "0.32.1"
 resolution = true
 skip-lint = false
 
+[programs.localnet]
+fee_distribution = "6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm"
+
 [programs.devnet]
 fee_distribution = "11111111111111111111111111111111"
 
