@@ -32,6 +32,25 @@ class NetworkType(str, Enum):
     LOCALNET = "localnet"
 
 
+class RentDuration(int, Enum):
+    """Rental duration options (Borsh-encoded as u8 variant index)."""
+    Day   = 0  # ~1 day   (86 400 s)
+    Week  = 1  # ~7 days  (604 800 s)
+    Month = 2  # ~30 days (2 592 000 s)
+
+    def to_seconds(self) -> int:
+        return {0: 86_400, 1: 604_800, 2: 2_592_000}[self.value]
+
+
+class RentStatus(int, Enum):
+    """Rental lifecycle status (stored as u8 in FeeRecord)."""
+    Pending   = 0  # paid, 100% locked, waiting for recipient to activate
+    Active    = 1  # recipient activated; timer running
+    Completed = 2  # rental period expired; all parties may withdraw
+    Reverted  = 3  # cancelled by payer/owner while Pending; 100% refunded
+    Revoked   = 4  # cancelled by oracle; 100% refunded
+
+
 @dataclass
 class ContractAccount:
     """Represents a contract-related account."""
@@ -70,8 +89,10 @@ class ContractInteractor:
     DISCRIMINATOR_FINALIZE_RENT       = b'\x61\x3d\xf2\xad\x9d\x0d\xc2\xcf'
     DISCRIMINATOR_REVERT_RENT         = b'\xc2\x28\x71\xf8\x67\x2f\xa9\xcf'
     DISCRIMINATOR_CLAIM_OWNER_FEE     = b'\x24\x2c\xb7\xd0\x7a\x63\x22\x89'
-    DISCRIMINATOR_REVOKE_BY_ORACLE    = b'\x63\x3b\x94\xf4\xec\x3d\x0c\x99'
-    DISCRIMINATOR_UPDATE_ORACLE       = b'\x70\x29\xd1\x12\xf8\xe2\xfc\xbc'
+    DISCRIMINATOR_REVOKE_BY_ORACLE       = b'\x63\x3b\x94\xf4\xec\x3d\x0c\x99'
+    DISCRIMINATOR_UPDATE_ORACLE           = b'\x70\x29\xd1\x12\xf8\xe2\xfc\xbc'
+    DISCRIMINATOR_ACTIVATE_RENT           = b'\x81\x0d\x04\x42\x82\x7b\x18\xdb'
+    DISCRIMINATOR_CLAIM_RECIPIENT_FEE     = b'\x12\x0d\xa8\x21\xc0\xc8\x94\x1a'
     
     # Constants
     PRECISION = 1_000_000_000_000
@@ -266,56 +287,92 @@ class ContractInteractor:
     def create_rent_space_instruction(
         self,
         recipient: Pubkey,
-        expiration_time: int,
+        duration: RentDuration,
         payment_amount: int,
         payer: Pubkey,
         payer_token_account: Pubkey,
-        recipient_token_account: Pubkey,
         governance_token_mint: Pubkey,
         fee_record_count: int = 0
     ) -> Instruction:
         """
         Create instruction for rent_space function.
-        
+
+        Locks 100% of payment_amount in the fee vault as Pending. The rental
+        timer does NOT start here — call activate_rent to start the clock.
+
         Args:
-            recipient: Recipient pubkey
-            expiration_time: Unix timestamp for payment expiration
-            payment_amount: Amount to transfer in token base units
+            recipient: Recipient (profile owner) pubkey
+            duration: RentDuration.Day / Week / Month
+            payment_amount: Amount to lock in token base units
             payer: Payer signer pubkey
-            payer_token_account: Payer's token account
-            recipient_token_account: Recipient's token account
+            payer_token_account: Payer's token account (source of funds)
             governance_token_mint: Governance token mint
-            fee_record_count: Current fee record count (for seed derivation)
-        
+            fee_record_count: Current fee record count (for PDA seed derivation)
+
         Returns:
             Instruction for rent_space
         """
         contract_pubkey, _ = self.get_contract_pda()
         fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
         fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_count)
-        
-        # Encode instruction data: discriminator + recipient + expiration_time + payment_amount
-        instruction_data = self.DISCRIMINATOR_RENT_SPACE
+
+        # Borsh encoding: recipient (32) + duration as u8 variant (1) + payment_amount u64 (8)
+        instruction_data  = self.DISCRIMINATOR_RENT_SPACE
         instruction_data += bytes(recipient)
-        instruction_data += expiration_time.to_bytes(8, byteorder='little', signed=True)
+        instruction_data += bytes([int(duration)])          # RentDuration variant index
         instruction_data += payment_amount.to_bytes(8, byteorder='little')
-        
+
         accounts = [
-            AccountMeta(pubkey=contract_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=contract_pubkey,       is_signer=False, is_writable=True),
             AccountMeta(pubkey=governance_token_mint, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
-            AccountMeta(pubkey=payer_token_account, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=recipient_token_account, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=fee_vault_pubkey, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=fee_record_pubkey, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=payer,                 is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=payer_token_account,   is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_vault_pubkey,      is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey,     is_signer=False, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM),  is_signer=False, is_writable=False),
             AccountMeta(pubkey=Pubkey.from_string(self.SYSTEM_PROGRAM), is_signer=False, is_writable=False),
         ]
-        
+
         return Instruction(
             program_id=self.program_id,
             accounts=accounts,
             data=instruction_data
+        )
+
+    def create_activate_rent_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        recipient: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction for activate_rent.
+
+        Called by the recipient to start the rental timer.
+        Status: Pending → Active.
+        The expiration_time is calculated on-chain as now + duration_secs.
+
+        Args:
+            payer: Original payer pubkey (used for fee record PDA seed)
+            fee_record_index: Index of the fee record
+            recipient: Recipient signer (must match fee_record.recipient)
+
+        Returns:
+            Instruction for activate_rent
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,   is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_record_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=recipient,         is_signer=True,  is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=self.DISCRIMINATOR_ACTIVATE_RENT
         )
     
     def create_init_holder_state_instruction(
@@ -486,6 +543,45 @@ class ContractInteractor:
             data=self.DISCRIMINATOR_FINALIZE_RENT
         )
 
+    def create_claim_recipient_fee_instruction(
+        self,
+        payer: Pubkey,
+        fee_record_index: int,
+        recipient: Pubkey,
+        recipient_token_account: Pubkey
+    ) -> Instruction:
+        """
+        Create instruction for the recipient to claim their 80% share from
+        a Completed rental record.
+
+        Args:
+            payer: Original payer pubkey (used for fee record PDA seed)
+            fee_record_index: Index of the fee record
+            recipient: Recipient signer (must match fee_record.recipient)
+            recipient_token_account: Recipient's token account to receive the 80% fee
+
+        Returns:
+            Instruction for claim_recipient_fee
+        """
+        contract_pubkey, _ = self.get_contract_pda()
+        fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
+        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
+
+        accounts = [
+            AccountMeta(pubkey=contract_pubkey,          is_signer=False, is_writable=False),
+            AccountMeta(pubkey=fee_vault_pubkey,         is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey,        is_signer=False, is_writable=True),
+            AccountMeta(pubkey=recipient,                is_signer=True,  is_writable=False),
+            AccountMeta(pubkey=recipient_token_account,  is_signer=False, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+        ]
+
+        return Instruction(
+            program_id=self.program_id,
+            accounts=accounts,
+            data=self.DISCRIMINATOR_CLAIM_RECIPIENT_FEE
+        )
+
     def create_revert_rent_instruction(
         self,
         payer: Pubkey,
@@ -494,8 +590,9 @@ class ContractInteractor:
         payer_token_account: Pubkey
     ) -> Instruction:
         """
-        Create instruction to revert a rent (loaner or owner only).
-        Returns governance + owner fees to the loaner.
+        Create instruction to revert a Pending rent (payer or contract owner only).
+        Only works before the recipient has called activate_rent.
+        Refunds 100% of the locked amount to the payer.
 
         Args:
             payer: Original payer (loaner) pubkey
@@ -574,7 +671,9 @@ class ContractInteractor:
     ) -> Instruction:
         """
         Create instruction for the oracle to revoke a rent (violation detected).
-        The full locked fee (governance + owner) is refunded to the loaner.
+        Works in both Pending and Active status.
+        100% of the locked funds are returned to the payer; the recipient forfeits
+        their share upon violation.
 
         Args:
             payer: Original payer (loaner) pubkey
@@ -690,41 +789,48 @@ class ContractInteractor:
         Get fee record from chain.
 
         FeeRecord borsh layout (after 8-byte discriminator):
-          contract          [0:32]
-          payer             [32:64]
-          recipient         [64:96]
-          expiration_time   [96:104]  (i64)
-          total_amount      [104:112] (u64)
-          governance_fee    [112:120] (u64)  — 15 %
-          owner_fee         [120:128] (u64)  —  5 %
-          timestamp         [128:136] (i64)
-          index             [136:144] (u64)
-          is_finalized      [144]     (bool)
-          is_reverted       [145]     (bool)
-          owner_fee_claimed [146]     (bool)
+          contract              [0:32]    (Pubkey)
+          payer                 [32:64]   (Pubkey)
+          recipient             [64:96]   (Pubkey)
+          duration              [96]      (u8 — RentDuration variant)
+          status                [97]      (u8 — RentStatus variant)
+          activated_at          [98:106]  (i64, 0 if Pending)
+          expiration_time       [106:114] (i64, 0 if Pending)
+          total_amount          [114:122] (u64 — 100% locked in vault)
+          governance_fee        [122:130] (u64 — 15%)
+          owner_fee             [130:138] (u64 —  5%)
+          recipient_fee         [138:146] (u64 — 80%)
+          timestamp             [146:154] (i64 — record creation time)
+          index                 [154:162] (u64)
+          owner_fee_claimed     [162]     (bool)
+          recipient_fee_claimed [163]     (bool)
+        Total: 164 bytes (FEE_RECORD_SPACE pads to 168)
         """
         try:
             fee_record_pubkey, _ = self.get_fee_record_pda(payer, index)
             account = self.get_account_info(fee_record_pubkey)
 
-            if not account or len(account.data) < 155:  # 8 + 147
+            if not account or len(account.data) < 172:  # 8 discriminator + 164
                 return None
 
             data = account.data[8:]
             return {
-                'address':          str(fee_record_pubkey),
-                'contract':         str(Pubkey(data[0:32])),
-                'payer':            str(Pubkey(data[32:64])),
-                'recipient':        str(Pubkey(data[64:96])),
-                'expiration_time':  int.from_bytes(data[96:104],  byteorder='little', signed=True),
-                'total_amount':     int.from_bytes(data[104:112], byteorder='little'),
-                'governance_fee':   int.from_bytes(data[112:120], byteorder='little'),
-                'owner_fee':        int.from_bytes(data[120:128], byteorder='little'),
-                'timestamp':        int.from_bytes(data[128:136], byteorder='little', signed=True),
-                'index':            int.from_bytes(data[136:144], byteorder='little'),
-                'is_finalized':     bool(data[144]),
-                'is_reverted':      bool(data[145]),
-                'owner_fee_claimed': bool(data[146]),
+                'address':               str(fee_record_pubkey),
+                'contract':              str(Pubkey(data[0:32])),
+                'payer':                 str(Pubkey(data[32:64])),
+                'recipient':             str(Pubkey(data[64:96])),
+                'duration':              RentDuration(data[96]),
+                'status':                RentStatus(data[97]),
+                'activated_at':          int.from_bytes(data[98:106],  byteorder='little', signed=True),
+                'expiration_time':       int.from_bytes(data[106:114], byteorder='little', signed=True),
+                'total_amount':          int.from_bytes(data[114:122], byteorder='little'),
+                'governance_fee':        int.from_bytes(data[122:130], byteorder='little'),
+                'owner_fee':             int.from_bytes(data[130:138], byteorder='little'),
+                'recipient_fee':         int.from_bytes(data[138:146], byteorder='little'),
+                'timestamp':             int.from_bytes(data[146:154], byteorder='little', signed=True),
+                'index':                 int.from_bytes(data[154:162], byteorder='little'),
+                'owner_fee_claimed':     bool(data[162]),
+                'recipient_fee_claimed': bool(data[163]),
             }
         except Exception as e:
             raise RuntimeError(f"Failed to get fee record: {e}")
@@ -857,14 +963,42 @@ class ContractInteractor:
             if "RentSpaceEvent" in log or "rent_space" in log:
                 return {"raw_log": log}
         return None
-    
+
+    def parse_activate_rent_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
+        """Parse ActivateRentEvent from transaction logs."""
+        for log in logs:
+            if "ActivateRentEvent" in log or "activate_rent" in log:
+                return {"raw_log": log}
+        return None
+
+    def parse_finalize_rent_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
+        """Parse FinalizeRentEvent from transaction logs."""
+        for log in logs:
+            if "FinalizeRentEvent" in log or "finalize_rent" in log:
+                return {"raw_log": log}
+        return None
+
+    def parse_claim_recipient_fee_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
+        """Parse ClaimRecipientFeeEvent from transaction logs."""
+        for log in logs:
+            if "ClaimRecipientFeeEvent" in log or "claim_recipient_fee" in log:
+                return {"raw_log": log}
+        return None
+
+    def parse_revoke_by_oracle_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
+        """Parse RevokeByOracleEvent from transaction logs."""
+        for log in logs:
+            if "RevokeByOracleEvent" in log or "revoke_by_oracle" in log:
+                return {"raw_log": log}
+        return None
+
     def parse_claim_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
-        """Parse ClaimEvent from transaction logs."""
+        """Parse ClaimEvent (governance holders) from transaction logs."""
         for log in logs:
             if "ClaimEvent" in log or "claim_fees" in log:
                 return {"raw_log": log}
         return None
-    
+
     def parse_supply_snapshot_event(self, logs: List[str]) -> Optional[Dict[str, Any]]:
         """Parse SupplySnapshotUpdated event from transaction logs."""
         for log in logs:

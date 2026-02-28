@@ -1,11 +1,14 @@
 """
 Test suite for the fee_distribution Solana program.
 
-Fee model:
-  80% → renter (immediate)
-  15% → fee vault, claimable by governance holders after finalize_rent
-   5% → fee vault, claimable by contract owner after finalize_rent
-  revert_rent / revoke_by_oracle send vault funds back to the loaner.
+Fee model (per rent):
+  100% locked in fee vault on rent_space (Pending)
+  recipient activates via activate_rent (Active, timer starts)
+  after expiry, anyone calls finalize_rent (Completed):
+    15% → released to governance holder accumulator
+    80% → claimable by recipient via claim_recipient_fee
+     5% → claimable by contract owner via claim_owner_fee
+  revert_rent (Pending only) / revoke_by_oracle → 100% refund to payer
 
 Requires:
     pip install anchorpy pytest pytest-asyncio solana solders spl-token
@@ -17,6 +20,8 @@ import asyncio
 import struct
 import time
 import pytest
+import attr
+from borsh_construct.enum import _make_enum
 
 from anchorpy import Program, Provider, Context
 from solders.keypair import Keypair
@@ -35,16 +40,26 @@ SUPPLY    = 1_000_000
 PAYMENT   = 1_000
 
 # 80 / 15 / 5 split on PAYMENT = 1000
-EXPECTED_RECIPIENT   = 800   # 80 % — sent to renter immediately
-EXPECTED_GOV_FEE     = 150   # 15 % — locked in vault for governance holders
-EXPECTED_OWNER_FEE   = 50    #  5 % — locked in vault for contract owner
-EXPECTED_VAULT_TOTAL = 200   # 20 % — total locked (gov + owner)
+EXPECTED_RECIPIENT   = 800   # 80 % — claimable by recipient via claim_recipient_fee
+EXPECTED_GOV_FEE     = 150   # 15 % — released to accumulator on finalize_rent
+EXPECTED_OWNER_FEE   = 50    #  5 % — claimable by owner via claim_owner_fee
+EXPECTED_VAULT_TOTAL = 1000  # 100 % locked in vault on rent_space (refunded on revert/revoke)
+
+# RentDuration enum variants — use proper sumtype instances for borsh_construct
+_RentDuration  = _make_enum("Day", "Week", "Month", "Short", name="RentDuration")
+DURATION_DAY   = _RentDuration.Day()
+DURATION_WEEK  = _RentDuration.Week()
+DURATION_MONTH = _RentDuration.Month()
+DURATION_SHORT = _RentDuration.Short()   # 10 s — for tests that need expiry
 
 # After finalising one rent with governance_fee = 150 and SUPPLY = 1_000_000:
 #   delta     = (150 * PRECISION) / SUPPLY        = 150_000_000
 #   claimable = (SUPPLY * delta)  / PRECISION     = 150
 EXPECTED_HOLDER_CLAIM = 150
 EXPECTED_OWNER_CLAIM  = 50
+
+# Short-duration expiry wait (must be > RentDuration::Short = 10 s)
+SHORT_EXPIRY_WAIT = 15   # seconds
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -236,33 +251,72 @@ async def create_rent(
     mint: Pubkey,
     pdas: dict,
     token_accounts: dict,
-    expiration_offset: int,
+    duration=None,
 ) -> tuple:
-    """Create a rent and return (fee_record_pda, record_index)."""
+    """Create a rent (Pending) and return (fee_record_pda, record_index).
+
+    All of PAYMENT is locked in the fee vault — no immediate recipient transfer.
+    ``duration`` is a RentDuration anchorpy dict, default Day.
+    """
+    if duration is None:
+        duration = DURATION_DAY
+
     state  = await program.account["ContractState"].fetch(pdas["contract"])
     index  = state.fee_record_count
     fr_pda = fee_record_pda(program, payer.pubkey(), index)
 
     await program.rpc["rent_space"](
         recipient.pubkey(),
-        int(time.time()) + expiration_offset,
+        duration,
         PAYMENT,
         ctx=Context(
             accounts={
-                "contract":               pdas["contract"],
-                "governance_token_mint":  mint,
-                "payer":                  payer.pubkey(),
-                "payer_token_account":    token_accounts["payer"],
-                "recipient_token_account": token_accounts["recipient"],
-                "fee_vault":              pdas["fee_vault"],
-                "fee_record":             fr_pda,
-                "token_program":          TOKEN_PROGRAM_ID,
-                "system_program":         SYS_PROGRAM_ID,
+                "contract":              pdas["contract"],
+                "governance_token_mint": mint,
+                "payer":                 payer.pubkey(),
+                "payer_token_account":   token_accounts["payer"],
+                "fee_vault":             pdas["fee_vault"],
+                "fee_record":            fr_pda,
+                "token_program":         TOKEN_PROGRAM_ID,
+                "system_program":        SYS_PROGRAM_ID,
             },
             signers=[payer],
         ),
     )
     return fr_pda, index
+
+
+async def activate_rent_rpc(
+    program: Program,
+    provider: Provider,
+    recipient: Keypair,
+    fr_pda: Pubkey,
+    pdas: dict,
+) -> None:
+    """Activate a Pending rent (Pending → Active). recipient must sign."""
+    sig = await program.rpc["activate_rent"](
+        ctx=Context(
+            accounts={
+                "contract":   pdas["contract"],
+                "fee_record": fr_pda,
+                "recipient":  recipient.pubkey(),
+            },
+            signers=[recipient],
+        ),
+    )
+    await provider.connection.confirm_transaction(sig, commitment=Confirmed)
+
+
+async def warp_clock_forward(provider: Provider, days: int = 2) -> None:
+    """Wait for Short-duration rents (10 s) to expire.
+
+    Since solana-test-validator's Clock sysvar tracks wall time regardless of
+    slot number, there is no practical way to warp the unix_timestamp via
+    RPC without restarting the validator. Instead, the tests use
+    DURATION_SHORT (10 s) for rents that need to be finalized, and this
+    helper simply sleeps past the expiry window.
+    """
+    await asyncio.sleep(SHORT_EXPIRY_WAIT)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,32 +431,30 @@ async def test_rent_space_correct_split(
     base_count: int,
 ):
     """
-    rent_space sends 80 % to the renter immediately and locks 20 %
-    (15 % governance + 5 % owner) in the fee vault.
-    Creates rent[0] with a 1-hour expiry.
+    rent_space locks 100 % of PAYMENT in the fee vault (Pending status).
+    No immediate recipient transfer — recipient claims 80 % via claim_recipient_fee
+    after the rental is Completed.
+    Creates rent[base_count+0] (Day duration, Pending).
     """
-    recipient_before = await get_token_balance(provider, token_accounts["recipient"])
-    vault_before     = await get_token_balance(provider, pdas["fee_vault"])
+    vault_before = await get_token_balance(provider, pdas["fee_vault"])
 
     fr_pda, _ = await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
-        expiration_offset=3600,
     )
 
-    recipient_after = await get_token_balance(provider, token_accounts["recipient"])
-    vault_after     = await get_token_balance(provider, pdas["fee_vault"])
+    vault_after = await get_token_balance(provider, pdas["fee_vault"])
 
-    assert recipient_after - recipient_before == EXPECTED_RECIPIENT,   "80 % not sent to recipient"
-    assert vault_after     - vault_before     == EXPECTED_VAULT_TOTAL, "20 % not locked in vault"
+    assert vault_after - vault_before == EXPECTED_VAULT_TOTAL, "100 % not locked in vault"
 
     # Verify FeeRecord fields
     rec = await program.account["FeeRecord"].fetch(fr_pda)
-    assert rec.governance_fee    == EXPECTED_GOV_FEE
-    assert rec.owner_fee         == EXPECTED_OWNER_FEE
-    assert rec.total_amount      == PAYMENT
-    assert rec.is_finalized      is False
-    assert rec.is_reverted       is False
-    assert rec.owner_fee_claimed is False
+    assert rec.governance_fee         == EXPECTED_GOV_FEE
+    assert rec.owner_fee              == EXPECTED_OWNER_FEE
+    assert rec.recipient_fee          == EXPECTED_RECIPIENT
+    assert rec.total_amount           == PAYMENT
+    assert rec.status                 == 0,     "status must be Pending (0)"
+    assert rec.owner_fee_claimed      is False
+    assert rec.recipient_fee_claimed  is False
 
 
 @pytest.mark.asyncio
@@ -419,15 +471,11 @@ async def test_accumulator_not_updated_before_finalize(
     via state snapshot taken during base_count, so here we just verify it equals the
     value at time of rent_space: fee_vault has grown but accumulator has NOT).
     """
-    # Fetch current accumulator and total_fees — they should be unchanged since rent_space
-    # does NOT call finalize_rent. We verify the record itself is unfinalized.
-    state = await program.account["ContractState"].fetch(pdas["contract"])
-    # The accumulator should NOT have changed since the last rent_space
-    # (rent_space doesn't update it). We check the newly-created fee record is unfinalized.
+    # rent_space only changes the fee vault balance — accumulator is NOT updated.
+    # Verify the newly-created record is in Pending status.
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 0)
     rec = await program.account["FeeRecord"].fetch(fr_pda)
-    assert rec.is_finalized is False, "FeeRecord must not be finalized after rent_space"
-    assert rec.is_reverted  is False, "FeeRecord must not be reverted after rent_space"
+    assert rec.status == 0, "FeeRecord must be in Pending (0) status after rent_space"
 
 
 @pytest.mark.asyncio
@@ -445,6 +493,7 @@ async def test_fee_record_count_incremented(program: Program, pdas: dict, base_c
 @pytest.mark.asyncio
 async def test_finalize_before_expiry_fails(
     program: Program,
+    provider: Provider,
     payer: Keypair,
     recipient: Keypair,
     mint: Pubkey,
@@ -453,12 +502,16 @@ async def test_finalize_before_expiry_fails(
 ):
     """
     finalize_rent before expiry must raise RentNotExpired.
-    Also creates rent[1] with a 4-second expiry so the next test can finalize it.
+    Creates rent[base_count+1] (Short=10s duration), activates it (Active),
+    then immediately tries to finalize — must fail with 'not yet expired'.
     """
     fr_pda, _ = await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
-        expiration_offset=4,
+        duration=DURATION_SHORT,
     )
+
+    # Activate the rent so it is Active (expiry = now + 10 s)
+    await activate_rent_rpc(program, provider, recipient, fr_pda, pdas)
 
     with pytest.raises(Exception, match="Rental period has not yet expired"):
         await program.rpc["finalize_rent"](
@@ -477,17 +530,19 @@ async def test_finalize_before_expiry_fails(
 @pytest.mark.asyncio
 async def test_finalize_rent_succeeds(
     program: Program,
+    provider: Provider,
     payer: Keypair,
     pdas: dict,
     base_count: int,
 ):
     """
     After expiry, finalize_rent releases governance fees into the accumulator.
-    Sleeps past rent[1]'s 4-second expiry then finalizes.
+    rent[base_count+1] used Short (10 s) duration; warp_clock_forward sleeps
+    past expiry then finalize is called.
     """
-    await asyncio.sleep(5)
+    await warp_clock_forward(provider, days=2)
 
-    fr_pda     = fee_record_pda(program, payer.pubkey(), base_count + 1)
+    fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 1)
     state_before = await program.account["ContractState"].fetch(pdas["contract"])
     acc_before       = state_before.fees_per_token_accumulated
     acc_before_total = state_before.total_fees_accumulated
@@ -511,7 +566,49 @@ async def test_finalize_rent_succeeds(
     assert state.total_fees_accumulated == acc_before_total + EXPECTED_GOV_FEE
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
-    assert rec.is_finalized is True
+    assert rec.status == 2, "status must be Completed (2) after finalize_rent"
+
+
+# ── 4b. claim_recipient_fee ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_claim_recipient_fee_succeeds(
+    program: Program,
+    provider: Provider,
+    payer: Keypair,
+    recipient: Keypair,
+    pdas: dict,
+    token_accounts: dict,
+    base_count: int,
+):
+    """
+    Recipient claims their 80 % share from finalized rent[base_count+1].
+    Vault releases EXPECTED_RECIPIENT (800) tokens to the recipient ATA.
+    """
+    fr_pda          = fee_record_pda(program, payer.pubkey(), base_count + 1)
+    rec_before      = await get_token_balance(provider, token_accounts["recipient"])
+
+    await program.rpc["claim_recipient_fee"](
+        ctx=Context(
+            accounts={
+                "contract":                pdas["contract"],
+                "fee_vault":               pdas["fee_vault"],
+                "fee_record":              fr_pda,
+                "recipient":               recipient.pubkey(),
+                "recipient_token_account": token_accounts["recipient"],
+                "token_program":           TOKEN_PROGRAM_ID,
+            },
+            signers=[recipient],
+        ),
+    )
+
+    rec_after = await get_token_balance(provider, token_accounts["recipient"])
+    assert rec_after - rec_before == EXPECTED_RECIPIENT, \
+        f"Expected {EXPECTED_RECIPIENT} tokens to recipient, got {rec_after - rec_before}"
+
+    fee_rec = await program.account["FeeRecord"].fetch(fr_pda)
+    assert fee_rec.recipient_fee_claimed is True
 
 
 @pytest.mark.asyncio
@@ -521,10 +618,10 @@ async def test_cannot_finalize_twice(
     pdas: dict,
     base_count: int,
 ):
-    """Double-finalize must raise RentAlreadyFinalized."""
+    """Double-finalize on a Completed record must raise RentNotActive."""
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 1)
 
-    with pytest.raises(Exception, match="already been finalized"):
+    with pytest.raises(Exception, match="Rental must be in Active status"):
         await program.rpc["finalize_rent"](
             ctx=Context(
                 accounts={
@@ -620,10 +717,10 @@ async def test_claim_owner_fee_before_finalize_fails(
     token_accounts: dict,
     base_count: int,
 ):
-    """Owner cannot claim from rent[0] because it is not yet finalized."""
+    """Owner cannot claim from rent[base_count+0] because it is not yet Completed (Pending status)."""
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 0)
 
-    with pytest.raises(Exception, match="Rental period has not yet expired"):
+    with pytest.raises(Exception, match="Rental must be in Completed status"):
         await program.rpc["claim_owner_fee"](
             ctx=Context(
                 accounts={
@@ -744,8 +841,8 @@ async def test_revert_rent_by_payer(
     base_count: int,
 ):
     """
-    Payer reverts rent[0] (still unexpired).
-    The full 20 % (governance_fee + owner_fee) is returned to the payer.
+    Payer reverts rent[base_count+0] (still Pending — never activated).
+    The full 100 % (PAYMENT) is returned to the payer.
     """
     fr_pda       = fee_record_pda(program, payer.pubkey(), base_count + 0)
     payer_before = await get_token_balance(provider, token_accounts["payer"])
@@ -766,11 +863,11 @@ async def test_revert_rent_by_payer(
 
     payer_after = await get_token_balance(provider, token_accounts["payer"])
     refund      = payer_after - payer_before
-    assert refund == EXPECTED_VAULT_TOTAL, \
-        f"Expected refund of {EXPECTED_VAULT_TOTAL}, got {refund}"
+    assert refund == PAYMENT, \
+        f"Expected 100 % refund of {PAYMENT}, got {refund}"
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
-    assert rec.is_reverted is True
+    assert rec.status == 3, "status must be Reverted (3)"
 
 
 @pytest.mark.asyncio
@@ -781,10 +878,10 @@ async def test_cannot_revert_twice(
     token_accounts: dict,
     base_count: int,
 ):
-    """Second revert_rent must raise RentAlreadyReverted."""
+    """Second revert_rent on a Reverted record must raise RentNotPending."""
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 0)
 
-    with pytest.raises(Exception, match="already been reverted"):
+    with pytest.raises(Exception, match="Rental must be in Pending status"):
         await program.rpc["revert_rent"](
             ctx=Context(
                 accounts={
@@ -807,13 +904,12 @@ async def test_cannot_finalize_reverted_rent(
     pdas: dict,
     base_count: int,
 ):
-    """finalize_rent on a reverted record must raise RentAlreadyReverted or RentNotExpired.
-    Note: the contract checks expiration_time before is_reverted, so for a
-    non-expired reverted record the error is RentNotExpired.
+    """finalize_rent on a Reverted record must raise RentNotActive
+    (contract checks status == Active first, so the Reverted status fails that check).
     """
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 0)
 
-    with pytest.raises(Exception, match="Rental period has not yet expired|already been reverted"):
+    with pytest.raises(Exception, match="Rental must be in Active status"):
         await program.rpc["finalize_rent"](
             ctx=Context(
                 accounts={
@@ -844,12 +940,11 @@ async def test_revoke_by_oracle_wrong_key(
     base_count: int,
 ):
     """
-    Creates rent[2] (1-hour expiry) and tries to revoke it with the holder key
-    (not the oracle) — must raise UnauthorizedOracle.
+    Creates rent[base_count+2] (Day duration, Pending) and tries to revoke
+    it with the holder key (not the oracle) — must raise UnauthorizedOracle.
     """
     await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
-        expiration_offset=3600,
     )
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 2)
 
@@ -880,7 +975,7 @@ async def test_revoke_by_oracle_success(
     token_accounts: dict,
     base_count: int,
 ):
-    """Oracle revokes rent[2] — loaner gets the 20 % vault amount refunded."""
+    """Oracle revokes rent[base_count+2] (Pending) — payer gets 100 % refund."""
     fr_pda       = fee_record_pda(program, payer.pubkey(), base_count + 2)
     payer_before = await get_token_balance(provider, token_accounts["payer"])
 
@@ -901,11 +996,11 @@ async def test_revoke_by_oracle_success(
 
     payer_after = await get_token_balance(provider, token_accounts["payer"])
     refund      = payer_after - payer_before
-    assert refund == EXPECTED_VAULT_TOTAL, \
-        f"Expected refund {EXPECTED_VAULT_TOTAL}, got {refund}"
+    assert refund == PAYMENT, \
+        f"Expected 100 % refund {PAYMENT}, got {refund}"
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
-    assert rec.is_reverted is True
+    assert rec.status == 4, "status must be Revoked (4)"
 
 
 @pytest.mark.asyncio
@@ -917,10 +1012,10 @@ async def test_cannot_revoke_already_reverted(
     token_accounts: dict,
     base_count: int,
 ):
-    """Oracle cannot revoke a record that is already reverted."""
+    """Oracle cannot revoke a record that is already Revoked (status=4)."""
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 2)
 
-    with pytest.raises(Exception, match="already been reverted"):
+    with pytest.raises(Exception, match="Rental cannot be revoked"):
         await program.rpc["revoke_by_oracle"](
             "duplicate",
             ctx=Context(
@@ -946,10 +1041,10 @@ async def test_oracle_cannot_revoke_finalized(
     token_accounts: dict,
     base_count: int,
 ):
-    """Oracle cannot revoke an already-finalized record (rent[1])."""
+    """Oracle cannot revoke an already-Completed record (rent[base_count+1])."""
     fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 1)
 
-    with pytest.raises(Exception, match="already been finalized"):
+    with pytest.raises(Exception, match="Rental cannot be revoked"):
         await program.rpc["revoke_by_oracle"](
             "too late",
             ctx=Context(
@@ -1122,34 +1217,30 @@ async def test_update_supply_snapshot_unauthorized(
 
 
 @pytest.mark.asyncio
-async def test_rent_space_expired_timestamp(
+async def test_revert_active_rent_fails(
     program: Program,
     payer: Keypair,
-    recipient: Keypair,
-    mint: Pubkey,
     pdas: dict,
     token_accounts: dict,
+    base_count: int,
 ):
-    """rent_space with a past expiration_time must raise PaymentExpired."""
-    state  = await program.account["ContractState"].fetch(pdas["contract"])
-    fr_pda = fee_record_pda(program, payer.pubkey(), state.fee_record_count)
+    """
+    Attempting to revert a non-Pending record (rent[base_count+2], Revoked)
+    must raise RentNotPending.
+    (Previously tested PaymentExpired which no longer exists in the contract.)
+    """
+    fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 2)
 
-    with pytest.raises(Exception, match="Payment has expired"):
-        await program.rpc["rent_space"](
-            recipient.pubkey(),
-            int(time.time()) - 60,
-            PAYMENT,
+    with pytest.raises(Exception, match="Rental must be in Pending status"):
+        await program.rpc["revert_rent"](
             ctx=Context(
                 accounts={
-                    "contract":               pdas["contract"],
-                    "governance_token_mint":  mint,
-                    "payer":                  payer.pubkey(),
-                    "payer_token_account":    token_accounts["payer"],
-                    "recipient_token_account": token_accounts["recipient"],
-                    "fee_vault":              pdas["fee_vault"],
-                    "fee_record":             fr_pda,
-                    "token_program":          TOKEN_PROGRAM_ID,
-                    "system_program":         SYS_PROGRAM_ID,
+                    "contract":            pdas["contract"],
+                    "fee_vault":           pdas["fee_vault"],
+                    "fee_record":          fr_pda,
+                    "authority":           payer.pubkey(),
+                    "payer_token_account": token_accounts["payer"],
+                    "token_program":       TOKEN_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -1172,19 +1263,18 @@ async def test_rent_space_zero_payment(
     with pytest.raises(Exception, match="Invalid payment amount"):
         await program.rpc["rent_space"](
             recipient.pubkey(),
-            int(time.time()) + 3600,
+            DURATION_DAY,
             0,
             ctx=Context(
                 accounts={
-                    "contract":               pdas["contract"],
-                    "governance_token_mint":  mint,
-                    "payer":                  payer.pubkey(),
-                    "payer_token_account":    token_accounts["payer"],
-                    "recipient_token_account": token_accounts["recipient"],
-                    "fee_vault":              pdas["fee_vault"],
-                    "fee_record":             fr_pda,
-                    "token_program":          TOKEN_PROGRAM_ID,
-                    "system_program":         SYS_PROGRAM_ID,
+                    "contract":              pdas["contract"],
+                    "governance_token_mint": mint,
+                    "payer":                 payer.pubkey(),
+                    "payer_token_account":   token_accounts["payer"],
+                    "fee_vault":             pdas["fee_vault"],
+                    "fee_record":            fr_pda,
+                    "token_program":         TOKEN_PROGRAM_ID,
+                    "system_program":        SYS_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -1199,6 +1289,7 @@ async def test_rent_space_zero_payment(
 @pytest.mark.asyncio
 async def test_accumulator_grows_across_multiple_finalizations(
     program: Program,
+    provider: Provider,
     payer: Keypair,
     recipient: Keypair,
     mint: Pubkey,
@@ -1206,22 +1297,28 @@ async def test_accumulator_grows_across_multiple_finalizations(
     token_accounts: dict,
 ):
     """
-    Create two more rents with short expiry, finalize both, and verify
-    the accumulator grows additively by exactly 2 × delta.
+    Create two more rents (Short=10s duration), activate both, sleep past
+    expiry, finalize both, and verify the accumulator grows additively
+    by exactly 2 × delta.
     """
     state_before = await program.account["ContractState"].fetch(pdas["contract"])
     acc_before   = state_before.fees_per_token_accumulated
 
     fr_pda_a, _ = await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
-        expiration_offset=3,
+        duration=DURATION_SHORT,
     )
     fr_pda_b, _ = await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
-        expiration_offset=3,
+        duration=DURATION_SHORT,
     )
 
-    await asyncio.sleep(4)
+    # Activate both rents so the timer starts
+    await activate_rent_rpc(program, provider, recipient, fr_pda_a, pdas)
+    await activate_rent_rpc(program, provider, recipient, fr_pda_b, pdas)
+
+    # Sleep past expiry (Short duration = 10 s, sleep 15 s)
+    await warp_clock_forward(provider, days=2)
 
     for fr_pda in [fr_pda_a, fr_pda_b]:
         await program.rpc["finalize_rent"](

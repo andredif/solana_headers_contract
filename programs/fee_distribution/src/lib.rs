@@ -8,17 +8,60 @@ declare_id!("6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm");
 const PRECISION: u128 = 1_000_000_000_000;
 
 // Hardcoded space constants (8 = Anchor discriminator)
-// ContractState: 32 + 32 + 32 + 1 + 1 + 16 + 8 + 8 + 8 = 138 (added oracle: Pubkey)
+// ContractState: 32 + 32 + 32 + 1 + 1 + 16 + 8 + 8 + 8 = 138
 const CONTRACT_STATE_SPACE: usize = 8 + 138;
-// FeeRecord: 32+32+32 + 8+8+8+8+8+8 + 1+1+1 = 147, padded to 152
-const FEE_RECORD_SPACE: usize = 8 + 152;
+// FeeRecord (new layout): 32+32+32 + 1+1 + 8+8 + 8+8+8+8 + 8+8 + 1+1 = 164, padded to 168
+const FEE_RECORD_SPACE: usize = 8 + 168;
 // HolderState: 32 + 16 + 8 = 56
 const HOLDER_STATE_SPACE: usize = 8 + 56;
 
-// Fee distribution basis points (must sum to 100)
-const RECIPIENT_PCT: u64 = 80; // 80% to renter immediately
-const GOVERNANCE_PCT: u64 = 15; // 15% to governance holders (locked until expiry)
-const OWNER_PCT: u64 = 5;      // 5%  to contract owner    (locked until expiry)
+// Fee distribution percentages (must sum to 100)
+const RECIPIENT_PCT: u64 = 80; // 80% → loaner (profile owner), locked until Completed
+const GOVERNANCE_PCT: u64 = 15; // 15% → governance holders, released on finalize_rent
+const OWNER_PCT: u64 = 5;       //  5% → contract owner, claimable after Completed
+
+// ─── Rent duration options ────────────────────────────────────────────
+
+/// The three allowed rental durations. Stored as u8 in FeeRecord.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum RentDuration {
+    Day,   // 86 400 s  (~1 day)
+    Week,  // 604 800 s (~7 days)
+    Month, // 2 592 000 s (~30 days)
+    Short, // 10 s      (test/integration-only)
+}
+
+impl RentDuration {
+    pub fn to_seconds(self) -> i64 {
+        match self {
+            RentDuration::Day   => 86_400,
+            RentDuration::Week  => 604_800,
+            RentDuration::Month => 2_592_000,
+            RentDuration::Short => 10,
+        }
+    }
+}
+
+// ─── Rent lifecycle status ────────────────────────────────────────────
+//
+//   rent_space      activate_rent     finalize_rent (after expiry)
+//  ──────────────►  ─────────────►  ──────────────────────────────►
+//    Pending            Active               Completed
+//       │                 │
+//       ▼                 ▼
+//    Reverted           Revoked   (oracle; payer gets 100% refund)
+//  (payer/owner;
+//   payer gets 100% refund)
+
+/// Stored as u8 in FeeRecord.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum RentStatus {
+    Pending,   // 0 – paid, 100% locked, waiting for recipient to activate
+    Active,    // 1 – recipient activated; timer running, all funds still locked
+    Completed, // 2 – rental period expired; all parties may now withdraw
+    Reverted,  // 3 – cancelled by payer/owner while Pending; 100% refunded
+    Revoked,   // 4 – cancelled by oracle while Pending or Active; 100% refunded
+}
 
 #[program]
 pub mod fee_distribution {
@@ -41,7 +84,6 @@ pub mod fee_distribution {
         contract.fees_per_token_accumulated = 0;
         contract.total_fees_accumulated = 0;
         contract.fee_record_count = 0;
-        // Snapshot supply at init time to prevent manipulation
         contract.supply_snapshot = supply_snapshot;
 
         Ok(())
@@ -65,63 +107,9 @@ pub mod fee_distribution {
         Ok(())
     }
 
-    /// Oracle-only: revoke a rent when the renter violates the agreement
-    /// (e.g. swaps out the header image before expiration).
-    /// The oracle backend monitors the X/Twitter profile and calls this
-    /// instruction as soon as a violation is detected.
-    /// All locked fees (governance 15% + owner 5%) are returned to the loaner.
-    pub fn revoke_by_oracle(
-        ctx: Context<RevokeByOracle>,
-        reason: String,
-    ) -> Result<()> {
-        require!(
-            ctx.accounts.oracle.key() == ctx.accounts.contract.oracle,
-            FeeDistributionError::UnauthorizedOracle
-        );
+    // ─── Oracle management ────────────────────────────────────────────────────
 
-        let fee_record = &mut ctx.accounts.fee_record;
-        require!(!fee_record.is_finalized, FeeDistributionError::RentAlreadyFinalized);
-        require!(!fee_record.is_reverted,  FeeDistributionError::RentAlreadyReverted);
-
-        let refund_amount = fee_record.governance_fee
-            .checked_add(fee_record.owner_fee)
-            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
-
-        // Sign with contract PDA
-        let contract = &ctx.accounts.contract;
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
-        let signer_seeds = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.payer_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
-                signer_seeds,
-            ),
-            refund_amount,
-        )?;
-
-        fee_record.is_reverted = true;
-
-        emit!(RevokeByOracleEvent {
-            oracle: ctx.accounts.oracle.key(),
-            payer: fee_record.payer,
-            index: fee_record.index,
-            refund_amount,
-            reason,
-            timestamp: Clock::get()?.unix_timestamp,
-        });
-
-        Ok(())
-    }
-
-    /// Owner-only: update the supply snapshot used for fee calculations.
-    /// Should be called periodically via governance to reflect real supply.
+    /// Owner-only: refresh the token supply used in fee-per-token math.
     pub fn update_supply_snapshot(ctx: Context<UpdateSupplySnapshot>) -> Result<()> {
         let contract = &mut ctx.accounts.contract;
         require_eq!(
@@ -138,33 +126,25 @@ pub mod fee_distribution {
             new_supply,
             timestamp: Clock::get()?.unix_timestamp,
         });
-
         Ok(())
     }
 
+    // ─── Core rental flow ─────────────────────────────────────────────────────
+
+    /// Step 1 – Payer locks 100% of the payment into the fee vault and
+    /// records a FeeRecord in Pending status.
+    ///
+    /// Duration must be Day, Week, or Month.
+    /// The expiration timer does NOT start here — it starts in activate_rent.
     pub fn rent_space(
         ctx: Context<RentSpace>,
         recipient: Pubkey,
-        expiration_time: i64,
+        duration: RentDuration,
         payment_amount: u64,
     ) -> Result<()> {
         require!(payment_amount > 0, FeeDistributionError::InvalidPaymentAmount);
 
-        let now = Clock::get()?.unix_timestamp;
-        require!(expiration_time > now, FeeDistributionError::PaymentExpired);
-
-        require_eq!(
-            ctx.accounts.recipient_token_account.owner,
-            recipient,
-            FeeDistributionError::RecipientMismatch
-        );
-
-        // ── Fee split ──────────────────────────────────────────────────────
-        // 80% → renter immediately
-        // 15% → fee_vault (governance holders, unlocked by finalize_rent)
-        //  5% → fee_vault (contract owner,    unlocked by finalize_rent)
-        // The 15%+5% stay locked in the vault until expiration.
-        // revert_rent can return them to the payer before expiration.
+        // Pre-compute fee splits (amounts are stored; transfers happen later)
         let governance_fee = payment_amount
             .checked_mul(GOVERNANCE_PCT)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?
@@ -177,56 +157,43 @@ pub mod fee_distribution {
             .checked_div(100)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
-        let total_fee = governance_fee
-            .checked_add(owner_fee)
-            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
-
-        let payment_to_recipient = payment_amount
+        let recipient_fee = payment_amount
             .checked_mul(RECIPIENT_PCT)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?
             .checked_div(100)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
-        // Transfer 80% to recipient immediately
+        // Lock the entire payment in the fee vault (pull model — nobody can
+        // withdraw until the rent reaches Completed status).
         let cpi_accounts = Transfer {
-            from: ctx.accounts.payer_token_account.to_account_info(),
-            to: ctx.accounts.recipient_token_account.to_account_info(),
-            authority: ctx.accounts.payer.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
-            payment_to_recipient,
-        )?;
-
-        // Transfer 20% (15% governance + 5% owner) to fee vault — locked until expiry
-        let fee_cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
             to: ctx.accounts.fee_vault.to_account_info(),
             authority: ctx.accounts.payer.to_account_info(),
         };
         token::transfer(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), fee_cpi_accounts),
-            total_fee,
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+            payment_amount,
         )?;
 
-        // NOTE: accumulator NOT updated here — updated only in finalize_rent
-        // (after expiration), so governance holders cannot claim fees that may
-        // still be reverted.
+        let now = Clock::get()?.unix_timestamp;
         let contract = &mut ctx.accounts.contract;
-
         let fee_record = &mut ctx.accounts.fee_record;
-        fee_record.contract = contract.key();
-        fee_record.payer = ctx.accounts.payer.key();
-        fee_record.recipient = recipient;
-        fee_record.expiration_time = expiration_time;
-        fee_record.total_amount = payment_amount;
-        fee_record.governance_fee = governance_fee;
-        fee_record.owner_fee = owner_fee;
-        fee_record.timestamp = now;
-        fee_record.index = contract.fee_record_count;
-        fee_record.is_finalized = false;
-        fee_record.is_reverted = false;
-        fee_record.owner_fee_claimed = false;
+
+        fee_record.contract              = contract.key();
+        fee_record.payer                 = ctx.accounts.payer.key();
+        fee_record.recipient             = recipient;
+        fee_record.duration              = duration as u8;
+        fee_record.status                = RentStatus::Pending as u8;
+        fee_record.activated_at          = 0;
+        fee_record.expiration_time       = 0; // set in activate_rent
+        fee_record.total_amount          = payment_amount;
+        fee_record.governance_fee        = governance_fee;
+        fee_record.owner_fee             = owner_fee;
+        fee_record.recipient_fee         = recipient_fee;
+        fee_record.timestamp             = now;
+        fee_record.index                 = contract.fee_record_count;
+        fee_record.owner_fee_claimed     = false;
+        fee_record.recipient_fee_claimed = false;
 
         contract.fee_record_count = contract
             .fee_record_count
@@ -236,33 +203,79 @@ pub mod fee_distribution {
         emit!(RentSpaceEvent {
             payer: ctx.accounts.payer.key(),
             recipient,
-            expiration_time,
+            duration: duration as u8,
             payment_amount,
             governance_fee,
             owner_fee,
+            recipient_fee,
             timestamp: now,
         });
 
         Ok(())
     }
 
-    /// Finalise a rental after its expiration time has passed.
-    /// Releases the 15% governance fee into the accumulator (enabling holder
-    /// claims) and marks the record as finalized so the owner can withdraw
-    /// their 5% via claim_owner_fee.
-    /// Anyone can call this — it is a permissionless settlement.
+    /// Step 2 – Recipient (profile owner) accepts and activates the rental.
+    ///
+    /// The expiration clock starts from the moment this instruction is executed.
+    /// Status: Pending → Active.
+    pub fn activate_rent(ctx: Context<ActivateRent>) -> Result<()> {
+        let fee_record = &mut ctx.accounts.fee_record;
+
+        require!(
+            fee_record.status == RentStatus::Pending as u8,
+            FeeDistributionError::RentNotPending
+        );
+        require_eq!(
+            ctx.accounts.recipient.key(),
+            fee_record.recipient,
+            FeeDistributionError::UnauthorizedRecipient
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        let duration_secs = match fee_record.duration {
+            0 => RentDuration::Day.to_seconds(),
+            1 => RentDuration::Week.to_seconds(),
+            2 => RentDuration::Month.to_seconds(),
+            _ => RentDuration::Short.to_seconds(),
+        };
+
+        fee_record.activated_at    = now;
+        fee_record.expiration_time = now
+            .checked_add(duration_secs)
+            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+        fee_record.status = RentStatus::Active as u8;
+
+        emit!(ActivateRentEvent {
+            payer: fee_record.payer,
+            recipient: fee_record.recipient,
+            index: fee_record.index,
+            activated_at: now,
+            expiration_time: fee_record.expiration_time,
+        });
+
+        Ok(())
+    }
+
+    /// Step 3 – Permissionless settlement after the rental period expires.
+    ///
+    /// Transitions status Active → Completed and releases the 15% governance
+    /// fee into the per-token accumulator so holders can start claiming.
+    /// The 80% (recipient) and 5% (owner) remain in the vault; each party
+    /// must call their respective claim instruction to withdraw.
     pub fn finalize_rent(ctx: Context<FinalizeRent>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fee_record = &mut ctx.accounts.fee_record;
 
         require!(
+            fee_record.status == RentStatus::Active as u8,
+            FeeDistributionError::RentNotActive
+        );
+        require!(
             now >= fee_record.expiration_time,
             FeeDistributionError::RentNotExpired
         );
-        require!(!fee_record.is_finalized, FeeDistributionError::RentAlreadyFinalized);
-        require!(!fee_record.is_reverted,  FeeDistributionError::RentAlreadyReverted);
 
-        // Release governance fees into the accumulator using the snapshotted supply
+        // Release governance fees into the accumulator
         let contract = &mut ctx.accounts.contract;
         let supply = contract.supply_snapshot;
         let governance_fee = fee_record.governance_fee;
@@ -283,47 +296,47 @@ pub mod fee_distribution {
             .checked_add(governance_fee)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
-        fee_record.is_finalized = true;
+        fee_record.status = RentStatus::Completed as u8;
 
         emit!(FinalizeRentEvent {
             payer: fee_record.payer,
+            recipient: fee_record.recipient,
             index: fee_record.index,
             governance_fee,
             owner_fee: fee_record.owner_fee,
+            recipient_fee: fee_record.recipient_fee,
             timestamp: now,
         });
 
         Ok(())
     }
 
-    /// Revert a rental before it has been finalized.
-    /// Returns the full fee (governance 15% + owner 5%) to the original payer.
-    /// May be called by the payer themselves or by the contract owner.
-    pub fn revert_rent(ctx: Context<RevertRent>) -> Result<()> {
+    /// Recipient (loaner / profile owner) withdraws their 80% share after
+    /// the rental has reached Completed status.
+    pub fn claim_recipient_fee(ctx: Context<ClaimRecipientFee>) -> Result<()> {
         let fee_record = &mut ctx.accounts.fee_record;
 
-        require!(!fee_record.is_finalized, FeeDistributionError::RentAlreadyFinalized);
-        require!(!fee_record.is_reverted,  FeeDistributionError::RentAlreadyReverted);
-
-        // Only the payer (loaner) or the contract owner may revert
-        let authority_key = ctx.accounts.authority.key();
         require!(
-            authority_key == fee_record.payer || authority_key == ctx.accounts.contract.owner,
-            FeeDistributionError::UnauthorizedOwner
+            fee_record.status == RentStatus::Completed as u8,
+            FeeDistributionError::RentNotCompleted
+        );
+        require!(!fee_record.recipient_fee_claimed, FeeDistributionError::RecipientFeeAlreadyClaimed);
+        require_eq!(
+            ctx.accounts.recipient.key(),
+            fee_record.recipient,
+            FeeDistributionError::UnauthorizedRecipient
         );
 
-        let refund_amount = fee_record.governance_fee
-            .checked_add(fee_record.owner_fee)
-            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+        let recipient_fee = fee_record.recipient_fee;
+        require!(recipient_fee > 0, FeeDistributionError::NothingToClaim);
 
-        // Sign with contract PDA
         let contract = &ctx.accounts.contract;
         let seeds = &[b"contract".as_ref(), &[contract.bump]];
         let signer_seeds = &[&seeds[..]];
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.payer_token_account.to_account_info(),
+            to: ctx.accounts.recipient_token_account.to_account_info(),
             authority: ctx.accounts.contract.to_account_info(),
         };
         token::transfer(
@@ -332,29 +345,31 @@ pub mod fee_distribution {
                 cpi_accounts,
                 signer_seeds,
             ),
-            refund_amount,
+            recipient_fee,
         )?;
 
-        fee_record.is_reverted = true;
+        fee_record.recipient_fee_claimed = true;
 
-        emit!(RevertRentEvent {
+        emit!(ClaimRecipientFeeEvent {
+            recipient: ctx.accounts.recipient.key(),
             payer: fee_record.payer,
             index: fee_record.index,
-            refund_amount,
+            amount: recipient_fee,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
         Ok(())
     }
 
-    /// Contract owner withdraws their 5% fee from a finalized rental record.
+    /// Contract owner withdraws their 5% share from a Completed rental record.
     pub fn claim_owner_fee(ctx: Context<ClaimOwnerFee>) -> Result<()> {
         let fee_record = &mut ctx.accounts.fee_record;
 
-        require!(fee_record.is_finalized,        FeeDistributionError::RentNotExpired);
-        require!(!fee_record.is_reverted,         FeeDistributionError::RentAlreadyReverted);
-        require!(!fee_record.owner_fee_claimed,   FeeDistributionError::OwnerFeeAlreadyClaimed);
-
+        require!(
+            fee_record.status == RentStatus::Completed as u8,
+            FeeDistributionError::RentNotCompleted
+        );
+        require!(!fee_record.owner_fee_claimed, FeeDistributionError::OwnerFeeAlreadyClaimed);
         require_eq!(
             ctx.accounts.owner.key(),
             ctx.accounts.contract.owner,
@@ -364,7 +379,6 @@ pub mod fee_distribution {
         let owner_fee = fee_record.owner_fee;
         require!(owner_fee > 0, FeeDistributionError::NothingToClaim);
 
-        // Sign with contract PDA
         let contract = &ctx.accounts.contract;
         let seeds = &[b"contract".as_ref(), &[contract.bump]];
         let signer_seeds = &[&seeds[..]];
@@ -396,24 +410,124 @@ pub mod fee_distribution {
         Ok(())
     }
 
+    /// Payer or owner may cancel a rental that is still Pending (not yet
+    /// activated by the recipient). The full 100% is refunded to the payer.
+    /// Once activated, only the oracle can cancel (revoke_by_oracle).
+    pub fn revert_rent(ctx: Context<RevertRent>) -> Result<()> {
+        let fee_record = &mut ctx.accounts.fee_record;
+
+        require!(
+            fee_record.status == RentStatus::Pending as u8,
+            FeeDistributionError::RentNotPending
+        );
+
+        let authority_key = ctx.accounts.authority.key();
+        require!(
+            authority_key == fee_record.payer || authority_key == ctx.accounts.contract.owner,
+            FeeDistributionError::UnauthorizedOwner
+        );
+
+        let refund_amount = fee_record.total_amount; // 100% was locked
+
+        let contract = &ctx.accounts.contract;
+        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let signer_seeds = &[&seeds[..]];
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.fee_vault.to_account_info(),
+            to: ctx.accounts.payer_token_account.to_account_info(),
+            authority: ctx.accounts.contract.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer_seeds,
+            ),
+            refund_amount,
+        )?;
+
+        fee_record.status = RentStatus::Reverted as u8;
+
+        emit!(RevertRentEvent {
+            payer: fee_record.payer,
+            index: fee_record.index,
+            refund_amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    /// Oracle-only: revoke a rental when the recipient violates the agreement
+    /// (e.g. swaps out the header image before expiration).
+    ///
+    /// Works in both Pending and Active status.
+    /// 100% of the locked funds are returned to the original payer because
+    /// the recipient forfeits their share upon violation.
+    pub fn revoke_by_oracle(ctx: Context<RevokeByOracle>, reason: String) -> Result<()> {
+        require!(
+            ctx.accounts.oracle.key() == ctx.accounts.contract.oracle,
+            FeeDistributionError::UnauthorizedOracle
+        );
+
+        let fee_record = &mut ctx.accounts.fee_record;
+
+        let status = fee_record.status;
+        require!(
+            status == RentStatus::Pending as u8 || status == RentStatus::Active as u8,
+            FeeDistributionError::RentCannotBeRevoked
+        );
+
+        let refund_amount = fee_record.total_amount; // 100% locked in vault
+
+        let contract = &ctx.accounts.contract;
+        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let signer_seeds = &[&seeds[..]];
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.fee_vault.to_account_info(),
+            to: ctx.accounts.payer_token_account.to_account_info(),
+            authority: ctx.accounts.contract.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer_seeds,
+            ),
+            refund_amount,
+        )?;
+
+        fee_record.status = RentStatus::Revoked as u8;
+
+        emit!(RevokeByOracleEvent {
+            oracle: ctx.accounts.oracle.key(),
+            payer: fee_record.payer,
+            index: fee_record.index,
+            refund_amount,
+            reason,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    // ─── Governance holder fees ───────────────────────────────────────────────
+
     /// Must be called once per holder before they can claim.
-    /// Sets their baseline to the current accumulator so they only
-    /// earn fees generated after they register.
+    /// Sets their baseline to the current accumulator so they only earn
+    /// fees generated after they register.
     pub fn init_holder_state(ctx: Context<InitHolderState>) -> Result<()> {
         let holder_state = &mut ctx.accounts.holder_state;
         holder_state.holder = ctx.accounts.holder.key();
-        // Baseline set to current accumulator — prevents claiming past fees
         holder_state.fees_per_token_claimed = ctx.accounts.contract.fees_per_token_accumulated;
         holder_state.total_claimed = 0;
         Ok(())
     }
 
     /// Claim fees proportional to current governance token balance.
-    /// Uses contract PDA as vault authority to sign the transfer.
-    /// 
-    /// Anti-double-dip: tokens must be held in the same account registered
-    /// at init_holder_state time (enforced via has_one on holder_state).
-    /// Moving tokens to a new wallet resets the accumulator baseline.
+    /// Fees accrue only after finalize_rent is called for each rental.
     pub fn claim_fees(ctx: Context<ClaimFees>) -> Result<()> {
         let contract = &ctx.accounts.contract;
         let holder_state = &mut ctx.accounts.holder_state;
@@ -436,7 +550,6 @@ pub mod fee_distribution {
 
         require!(claimable > 0, FeeDistributionError::NothingToClaim);
 
-        // Sign with contract PDA seeds (contract is vault authority)
         let seeds = &[b"contract".as_ref(), &[contract.bump]];
         let signer_seeds = &[&seeds[..]];
 
@@ -454,7 +567,6 @@ pub mod fee_distribution {
             claimable,
         )?;
 
-        // Advance claimed pointer to prevent double-claiming
         holder_state.fees_per_token_claimed = contract.fees_per_token_accumulated;
         holder_state.total_claimed = holder_state
             .total_claimed
@@ -470,6 +582,8 @@ pub mod fee_distribution {
         Ok(())
     }
 
+    // ─── Admin ────────────────────────────────────────────────────────────────
+
     pub fn update_owner(ctx: Context<UpdateOwner>, new_owner: Pubkey) -> Result<()> {
         let contract = &mut ctx.accounts.contract;
         require_eq!(
@@ -482,60 +596,7 @@ pub mod fee_distribution {
     }
 }
 
-// ================== Oracle Account Structs ==================
-
-#[derive(Accounts)]
-pub struct UpdateOracle<'info> {
-    #[account(mut, seeds = [b"contract"], bump = contract.bump)]
-    pub contract: Account<'info, ContractState>,
-    /// Must be the current contract owner.
-    pub owner: Signer<'info>,
-}
-
-/// `reason` is passed as an instruction argument and forwarded to the event;
-/// it is NOT stored on-chain (keeps account size fixed).
-#[derive(Accounts)]
-pub struct RevokeByOracle<'info> {
-    #[account(
-        seeds = [b"contract"],
-        bump = contract.bump
-    )]
-    pub contract: Account<'info, ContractState>,
-
-    #[account(
-        mut,
-        seeds = [b"fee_vault", contract.key().as_ref()],
-        bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
-    )]
-    pub fee_vault: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        seeds = [
-            b"fee_record",
-            fee_record.payer.as_ref(),
-            &fee_record.index.to_le_bytes()
-        ],
-        bump
-    )]
-    pub fee_record: Account<'info, FeeRecord>,
-
-    /// Must match `contract.oracle`; checked in instruction logic.
-    pub oracle: Signer<'info>,
-
-    /// Token account of the original loaner (payer) — receives the refund.
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = fee_record.payer,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-// ================== Accounts ==================
+// ================== Account constraint structs ==================
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -550,7 +611,6 @@ pub struct Initialize<'info> {
 
     pub governance_token_mint: Account<'info, Mint>,
 
-    /// Contract PDA is authority — avoids circular self-authority issue
     #[account(
         init,
         payer = signer,
@@ -568,7 +628,91 @@ pub struct Initialize<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-// ── New instruction account structs ──────────────────────────────────────
+#[derive(Accounts)]
+pub struct UpdateOracle<'info> {
+    #[account(mut, seeds = [b"contract"], bump = contract.bump)]
+    pub contract: Account<'info, ContractState>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateSupplySnapshot<'info> {
+    #[account(mut, seeds = [b"contract"], bump = contract.bump)]
+    pub contract: Account<'info, ContractState>,
+    pub governance_token_mint: Account<'info, Mint>,
+    pub owner: Signer<'info>,
+}
+
+// ─── Rental flow ──────────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+#[instruction(recipient: Pubkey, duration: RentDuration, payment_amount: u64)]
+pub struct RentSpace<'info> {
+    #[account(
+        mut,
+        seeds = [b"contract"],
+        bump = contract.bump
+    )]
+    pub contract: Account<'info, ContractState>,
+
+    pub governance_token_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Token account from which the full payment is drawn.
+    #[account(
+        mut,
+        token::mint = contract.governance_token_mint,
+        token::authority = payer,
+    )]
+    pub payer_token_account: Account<'info, TokenAccount>,
+
+    /// Fee vault receives and holds 100% until the rental is Completed.
+    #[account(
+        mut,
+        seeds = [b"fee_vault", contract.key().as_ref()],
+        bump = contract.fee_vault_bump,
+        token::mint = contract.governance_token_mint,
+    )]
+    pub fee_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = FEE_RECORD_SPACE,
+        seeds = [
+            b"fee_record",
+            payer.key().as_ref(),
+            &contract.fee_record_count.to_le_bytes()
+        ],
+        bump
+    )]
+    pub fee_record: Account<'info, FeeRecord>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ActivateRent<'info> {
+    #[account(seeds = [b"contract"], bump = contract.bump)]
+    pub contract: Account<'info, ContractState>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"fee_record",
+            fee_record.payer.as_ref(),
+            &fee_record.index.to_le_bytes()
+        ],
+        bump
+    )]
+    pub fee_record: Account<'info, FeeRecord>,
+
+    /// Must match fee_record.recipient; verified in instruction logic.
+    pub recipient: Signer<'info>,
+}
 
 #[derive(Accounts)]
 pub struct FinalizeRent<'info> {
@@ -603,11 +747,8 @@ pub struct FinalizeRent<'info> {
 }
 
 #[derive(Accounts)]
-pub struct RevertRent<'info> {
-    #[account(
-        seeds = [b"contract"],
-        bump = contract.bump
-    )]
+pub struct ClaimRecipientFee<'info> {
+    #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
     #[account(
@@ -629,27 +770,23 @@ pub struct RevertRent<'info> {
     )]
     pub fee_record: Account<'info, FeeRecord>,
 
-    /// Must be the original payer or the contract owner.
-    pub authority: Signer<'info>,
+    /// Must match fee_record.recipient; verified in instruction logic.
+    pub recipient: Signer<'info>,
 
-    /// Token account belonging to the original payer (loaner) that will
-    /// receive the refunded fees.
+    /// Destination for the 80% recipient share.
     #[account(
         mut,
         token::mint = contract.governance_token_mint,
-        token::authority = fee_record.payer,
+        token::authority = recipient,
     )]
-    pub payer_token_account: Account<'info, TokenAccount>,
+    pub recipient_token_account: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 pub struct ClaimOwnerFee<'info> {
-    #[account(
-        seeds = [b"contract"],
-        bump = contract.bump
-    )]
+    #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
     #[account(
@@ -682,35 +819,10 @@ pub struct ClaimOwnerFee<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-// ── Original account structs ───────────────────────────────────────────────
-
 #[derive(Accounts)]
-#[instruction(recipient: Pubkey, expiration_time: i64, payment_amount: u64)]
-pub struct RentSpace<'info> {
-    #[account(
-        mut,
-        seeds = [b"contract"],
-        bump = contract.bump
-    )]
+pub struct RevertRent<'info> {
+    #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
-
-    pub governance_token_mint: Account<'info, Mint>,
-
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = payer,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-    )]
-    pub recipient_token_account: Account<'info, TokenAccount>,
 
     #[account(
         mut,
@@ -721,33 +833,69 @@ pub struct RentSpace<'info> {
     pub fee_vault: Account<'info, TokenAccount>,
 
     #[account(
-        init,
-        payer = payer,
-        space = FEE_RECORD_SPACE,
+        mut,
         seeds = [
             b"fee_record",
-            payer.key().as_ref(),
-            &contract.fee_record_count.to_le_bytes()
+            fee_record.payer.as_ref(),
+            &fee_record.index.to_le_bytes()
         ],
         bump
     )]
     pub fee_record: Account<'info, FeeRecord>,
 
+    /// Must be the original payer or the contract owner.
+    pub authority: Signer<'info>,
+
+    /// Destination for the full 100% refund.
+    #[account(
+        mut,
+        token::mint = contract.governance_token_mint,
+        token::authority = fee_record.payer,
+    )]
+    pub payer_token_account: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct UpdateSupplySnapshot<'info> {
+pub struct RevokeByOracle<'info> {
+    #[account(seeds = [b"contract"], bump = contract.bump)]
+    pub contract: Account<'info, ContractState>,
+
     #[account(
         mut,
-        seeds = [b"contract"],
-        bump = contract.bump
+        seeds = [b"fee_vault", contract.key().as_ref()],
+        bump = contract.fee_vault_bump,
+        token::mint = contract.governance_token_mint,
     )]
-    pub contract: Account<'info, ContractState>,
-    pub governance_token_mint: Account<'info, Mint>,
-    pub owner: Signer<'info>,
+    pub fee_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"fee_record",
+            fee_record.payer.as_ref(),
+            &fee_record.index.to_le_bytes()
+        ],
+        bump
+    )]
+    pub fee_record: Account<'info, FeeRecord>,
+
+    /// Must match contract.oracle; verified in instruction logic.
+    pub oracle: Signer<'info>,
+
+    /// Payer receives the full 100% refund on revocation.
+    #[account(
+        mut,
+        token::mint = contract.governance_token_mint,
+        token::authority = fee_record.payer,
+    )]
+    pub payer_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
+
+// ─── Governance holder fee claiming ──────────────────────────────────────────
 
 #[derive(Accounts)]
 pub struct InitHolderState<'info> {
@@ -770,10 +918,7 @@ pub struct InitHolderState<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimFees<'info> {
-    #[account(
-        seeds = [b"contract"],
-        bump = contract.bump
-    )]
+    #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
     #[account(
@@ -810,13 +955,13 @@ pub struct UpdateOwner<'info> {
     pub owner: Signer<'info>,
 }
 
-// ================== State ==================
+// ================== On-chain state ==================
 
 #[account]
 pub struct ContractState {
     pub owner: Pubkey,                      // 32
     pub governance_token_mint: Pubkey,      // 32
-    pub oracle: Pubkey,                     // 32 — backend monitoring keypair
+    pub oracle: Pubkey,                     // 32
     pub bump: u8,                           // 1
     pub fee_vault_bump: u8,                 // 1
     pub fees_per_token_accumulated: u128,   // 16
@@ -827,19 +972,22 @@ pub struct ContractState {
 
 #[account]
 pub struct FeeRecord {
-    pub contract: Pubkey,        // 32
-    pub payer: Pubkey,           // 32
-    pub recipient: Pubkey,       // 32
-    pub expiration_time: i64,    // 8
-    pub total_amount: u64,       // 8
-    pub governance_fee: u64,     // 8  — 15% locked for governance holders
-    pub owner_fee: u64,          // 8  —  5% locked for contract owner
-    pub timestamp: i64,          // 8
-    pub index: u64,              // 8
-    pub is_finalized: bool,      // 1  — true after expiry is acknowledged
-    pub is_reverted: bool,       // 1  — true if fees were refunded to payer
-    pub owner_fee_claimed: bool, // 1  — true once owner has withdrawn their 5%
-}                                // = 147 (+ 5 pad = 152)
+    pub contract: Pubkey,            // 32
+    pub payer: Pubkey,               // 32
+    pub recipient: Pubkey,           // 32
+    pub duration: u8,                // 1  — RentDuration stored as u8
+    pub status: u8,                  // 1  — RentStatus stored as u8
+    pub activated_at: i64,           // 8  — Unix timestamp of activation (0 if Pending)
+    pub expiration_time: i64,        // 8  — activated_at + duration_secs (0 if Pending)
+    pub total_amount: u64,           // 8  — full payment locked in vault
+    pub governance_fee: u64,         // 8  — 15% released to accumulator on finalize
+    pub owner_fee: u64,              // 8  —  5% claimable by owner after Completed
+    pub recipient_fee: u64,          // 8  — 80% claimable by recipient after Completed
+    pub timestamp: i64,              // 8  — creation time of this record
+    pub index: u64,                  // 8  — sequential index per payer
+    pub owner_fee_claimed: bool,     // 1
+    pub recipient_fee_claimed: bool, // 1
+}                                    // = 164 (padded to 168 via FEE_RECORD_SPACE constant)
 
 #[account]
 pub struct HolderState {
@@ -854,19 +1002,31 @@ pub struct HolderState {
 pub struct RentSpaceEvent {
     pub payer: Pubkey,
     pub recipient: Pubkey,
-    pub expiration_time: i64,
+    pub duration: u8,
     pub payment_amount: u64,
     pub governance_fee: u64,
     pub owner_fee: u64,
+    pub recipient_fee: u64,
     pub timestamp: i64,
+}
+
+#[event]
+pub struct ActivateRentEvent {
+    pub payer: Pubkey,
+    pub recipient: Pubkey,
+    pub index: u64,
+    pub activated_at: i64,
+    pub expiration_time: i64,
 }
 
 #[event]
 pub struct FinalizeRentEvent {
     pub payer: Pubkey,
+    pub recipient: Pubkey,
     pub index: u64,
     pub governance_fee: u64,
     pub owner_fee: u64,
+    pub recipient_fee: u64,
     pub timestamp: i64,
 }
 
@@ -875,6 +1035,15 @@ pub struct RevertRentEvent {
     pub payer: Pubkey,
     pub index: u64,
     pub refund_amount: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct ClaimRecipientFeeEvent {
+    pub recipient: Pubkey,
+    pub payer: Pubkey,
+    pub index: u64,
+    pub amount: u64,
     pub timestamp: i64,
 }
 
@@ -913,8 +1082,6 @@ pub struct RevokeByOracleEvent {
     pub payer: Pubkey,
     pub index: u64,
     pub refund_amount: u64,
-    /// Human-readable reason logged by the backend (e.g. "header_image_changed").
-    /// Stored in the transaction log — not in account state.
     pub reason: String,
     pub timestamp: i64,
 }
@@ -929,8 +1096,8 @@ pub enum FeeDistributionError {
     ArithmeticOverflow,
     #[msg("Unauthorized owner")]
     UnauthorizedOwner,
-    #[msg("Payment has expired")]
-    PaymentExpired,
+    #[msg("Caller is not the authorised recipient for this rental")]
+    UnauthorizedRecipient,
     #[msg("Recipient does not match token account owner")]
     RecipientMismatch,
     #[msg("Invalid token mint")]
@@ -941,14 +1108,20 @@ pub enum FeeDistributionError {
     NothingToClaim,
     #[msg("Supply snapshot must be greater than zero")]
     InvalidSupplySnapshot,
+    #[msg("Rental must be in Pending status for this operation")]
+    RentNotPending,
+    #[msg("Rental must be in Active status for this operation")]
+    RentNotActive,
+    #[msg("Rental must be in Completed status to claim funds")]
+    RentNotCompleted,
     #[msg("Rental period has not yet expired")]
     RentNotExpired,
-    #[msg("This rental record has already been finalized")]
-    RentAlreadyFinalized,
-    #[msg("This rental record has already been reverted")]
-    RentAlreadyReverted,
+    #[msg("Rental cannot be revoked in its current status")]
+    RentCannotBeRevoked,
     #[msg("Owner fee has already been claimed for this record")]
     OwnerFeeAlreadyClaimed,
+    #[msg("Recipient fee has already been claimed for this record")]
+    RecipientFeeAlreadyClaimed,
     #[msg("Signer is not the authorised oracle")]
     UnauthorizedOracle,
 }

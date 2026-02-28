@@ -21,7 +21,7 @@ fee_distribution = "6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm"
 url = "https://api.github.com/repos/coral-xyz/anchor/releases/download"
 
 [provider]
-cluster = "testnet"
+cluster = "localnet"
 wallet = "./id.json"
 
 [scripts]
