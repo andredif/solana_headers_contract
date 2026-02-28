@@ -191,15 +191,11 @@ async def token_accounts(
 
     print(f"\n[token_accounts] mint={mint}, payer_new={payer_new}, holder_new={holder_new}")
 
-    # Only mint tokens if these are fresh ATAs
-    if payer_new:
-        print(f"[token_accounts] minting {SUPPLY} to payer_ata={payer_ata}")
-        await token.mint_to(payer_ata,  payer, SUPPLY)
-        print(f"[token_accounts] mint_to payer done")
-    if holder_new:
-        print(f"[token_accounts] minting {SUPPLY} to holder_ata={holder_ata}")
-        await token.mint_to(holder_ata, payer, SUPPLY)
-        print(f"[token_accounts] mint_to holder done")
+    # Unconditionally mint SUPPLY to payer and holder each session so there
+    # are always enough tokens for the test run regardless of prior runs or
+    # whether the accounts already existed.
+    await token.mint_to(payer_ata,  payer, SUPPLY)
+    await token.mint_to(holder_ata, payer, SUPPLY)
     return {
         "payer":     payer_ata,
         "recipient": rec_ata,
