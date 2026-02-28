@@ -261,7 +261,7 @@ async def create_rent(
     index  = state.fee_record_count
     fr_pda = fee_record_pda(program, payer.pubkey(), index)
 
-    await program.rpc["rent_space"](
+    sig = await program.rpc["rent_space"](
         recipient.pubkey(),
         duration,
         PAYMENT,
@@ -279,6 +279,7 @@ async def create_rent(
             signers=[payer],
         ),
     )
+    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
     return fr_pda, index
 
 
