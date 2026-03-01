@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Transfer, Token};
-use anchor_spl::token::TokenAccount;
-use anchor_spl::token::Mint;
+use anchor_lang::system_program::{self, Transfer as SolTransfer};
+use anchor_spl::token::{TokenAccount, Mint};
 
 declare_id!("6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm");
 
@@ -163,15 +162,16 @@ pub mod fee_distribution {
             .checked_div(100)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
-        // Lock the entire payment in the fee vault (pull model — nobody can
-        // withdraw until the rent reaches Completed status).
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.payer_token_account.to_account_info(),
-            to: ctx.accounts.fee_vault.to_account_info(),
-            authority: ctx.accounts.payer.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+        // Lock the entire payment (lamports / SOL) in the fee vault.
+        // HDRZ is governance-only; all rental payments are in native SOL.
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.fee_vault.to_account_info(),
+                },
+            ),
             payment_amount,
         )?;
 
@@ -330,19 +330,18 @@ pub mod fee_distribution {
         let recipient_fee = fee_record.recipient_fee;
         require!(recipient_fee > 0, FeeDistributionError::NothingToClaim);
 
-        let contract = &ctx.accounts.contract;
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let contract_key = ctx.accounts.contract.key();
+        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.recipient_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
+        system_program::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.fee_vault.to_account_info(),
+                    to: ctx.accounts.recipient.to_account_info(),
+                },
                 signer_seeds,
             ),
             recipient_fee,
@@ -379,19 +378,18 @@ pub mod fee_distribution {
         let owner_fee = fee_record.owner_fee;
         require!(owner_fee > 0, FeeDistributionError::NothingToClaim);
 
-        let contract = &ctx.accounts.contract;
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let contract_key = ctx.accounts.contract.key();
+        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.owner_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
+        system_program::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.fee_vault.to_account_info(),
+                    to: ctx.accounts.owner.to_account_info(),
+                },
                 signer_seeds,
             ),
             owner_fee,
@@ -429,19 +427,18 @@ pub mod fee_distribution {
 
         let refund_amount = fee_record.total_amount; // 100% was locked
 
-        let contract = &ctx.accounts.contract;
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let contract_key = ctx.accounts.contract.key();
+        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.payer_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
+        system_program::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.fee_vault.to_account_info(),
+                    to: ctx.accounts.payer.to_account_info(),
+                },
                 signer_seeds,
             ),
             refund_amount,
@@ -481,19 +478,18 @@ pub mod fee_distribution {
 
         let refund_amount = fee_record.total_amount; // 100% locked in vault
 
-        let contract = &ctx.accounts.contract;
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let contract_key = ctx.accounts.contract.key();
+        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.payer_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
+        system_program::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.fee_vault.to_account_info(),
+                    to: ctx.accounts.payer.to_account_info(),
+                },
                 signer_seeds,
             ),
             refund_amount,
@@ -550,18 +546,19 @@ pub mod fee_distribution {
 
         require!(claimable > 0, FeeDistributionError::NothingToClaim);
 
-        let seeds = &[b"contract".as_ref(), &[contract.bump]];
+        let contract_key = contract.key();
+        let vault_bump = contract.fee_vault_bump;
+        let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.fee_vault.to_account_info(),
-            to: ctx.accounts.holder_token_account.to_account_info(),
-            authority: ctx.accounts.contract.to_account_info(),
-        };
-        token::transfer(
+        // Pay out SOL (lamports) proportional to the holder's HDRZ balance.
+        system_program::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
+                ctx.accounts.system_program.to_account_info(),
+                SolTransfer {
+                    from: ctx.accounts.fee_vault.to_account_info(),
+                    to: ctx.accounts.holder.to_account_info(),
+                },
                 signer_seeds,
             ),
             claimable,
@@ -611,21 +608,18 @@ pub struct Initialize<'info> {
 
     pub governance_token_mint: Account<'info, Mint>,
 
+    /// CHECK: SOL vault PDA. Holds all locked rental payments as lamports.
+    /// Not formally initialized—funds are transferred to it on first deposit.
     #[account(
-        init,
-        payer = signer,
+        mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump,
-        token::mint = governance_token_mint,
-        token::authority = contract,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub signer: Signer<'info>,
-    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -655,27 +649,20 @@ pub struct RentSpace<'info> {
     )]
     pub contract: Account<'info, ContractState>,
 
+    /// HDRZ governance token mint — referenced by ContractState for holder math.
+    /// Not involved in the SOL payment transfer.
     pub governance_token_mint: Account<'info, Mint>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Token account from which the full payment is drawn.
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = payer,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
-
-    /// Fee vault receives and holds 100% until the rental is Completed.
+    /// CHECK: SOL vault PDA. Auto-created on first deposit.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: UncheckedAccount<'info>,
 
     #[account(
         init,
@@ -690,7 +677,6 @@ pub struct RentSpace<'info> {
     )]
     pub fee_record: Account<'info, FeeRecord>,
 
-    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
@@ -725,14 +711,6 @@ pub struct FinalizeRent<'info> {
 
     #[account(
         mut,
-        seeds = [b"fee_vault", contract.key().as_ref()],
-        bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
-    )]
-    pub fee_vault: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
         seeds = [
             b"fee_record",
             fee_record.payer.as_ref(),
@@ -751,13 +729,13 @@ pub struct ClaimRecipientFee<'info> {
     #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
+    /// SOL vault—holds all locked payments as lamports.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: SystemAccount<'info>,
 
     #[account(
         mut,
@@ -771,17 +749,10 @@ pub struct ClaimRecipientFee<'info> {
     pub fee_record: Account<'info, FeeRecord>,
 
     /// Must match fee_record.recipient; verified in instruction logic.
+    #[account(mut)]
     pub recipient: Signer<'info>,
 
-    /// Destination for the 80% recipient share.
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = recipient,
-    )]
-    pub recipient_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -789,13 +760,13 @@ pub struct ClaimOwnerFee<'info> {
     #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
+    /// SOL vault.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: SystemAccount<'info>,
 
     #[account(
         mut,
@@ -808,15 +779,11 @@ pub struct ClaimOwnerFee<'info> {
     )]
     pub fee_record: Account<'info, FeeRecord>,
 
+    /// Must match contract.owner.
+    #[account(mut)]
     pub owner: Signer<'info>,
 
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-    )]
-    pub owner_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -824,13 +791,13 @@ pub struct RevertRent<'info> {
     #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
+    /// SOL vault.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: SystemAccount<'info>,
 
     #[account(
         mut,
@@ -846,15 +813,12 @@ pub struct RevertRent<'info> {
     /// Must be the original payer or the contract owner.
     pub authority: Signer<'info>,
 
-    /// Destination for the full 100% refund.
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = fee_record.payer,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
+    /// Original payer wallet — receives the full 100% SOL refund.
+    /// CHECK: address is verified against fee_record.payer in the instruction.
+    #[account(mut)]
+    pub payer: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -862,13 +826,13 @@ pub struct RevokeByOracle<'info> {
     #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
+    /// SOL vault.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: SystemAccount<'info>,
 
     #[account(
         mut,
@@ -884,15 +848,12 @@ pub struct RevokeByOracle<'info> {
     /// Must match contract.oracle; verified in instruction logic.
     pub oracle: Signer<'info>,
 
-    /// Payer receives the full 100% refund on revocation.
-    #[account(
-        mut,
-        token::mint = contract.governance_token_mint,
-        token::authority = fee_record.payer,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
+    /// Payer wallet receives the full 100% SOL refund on revocation.
+    /// CHECK: address is verified against fee_record.payer in the instruction.
+    #[account(mut)]
+    pub payer: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 // ─── Governance holder fee claiming ──────────────────────────────────────────
@@ -921,13 +882,13 @@ pub struct ClaimFees<'info> {
     #[account(seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
+    /// SOL vault — source of claimable lamports.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
         bump = contract.fee_vault_bump,
-        token::mint = contract.governance_token_mint,
     )]
-    pub fee_vault: Account<'info, TokenAccount>,
+    pub fee_vault: SystemAccount<'info>,
 
     #[account(
         mut,
@@ -937,15 +898,18 @@ pub struct ClaimFees<'info> {
     )]
     pub holder_state: Account<'info, HolderState>,
 
+    /// HDRZ token account — read-only, used to determine the holder's proportional share.
     #[account(
-        mut,
         token::mint = contract.governance_token_mint,
         token::authority = holder,
     )]
     pub holder_token_account: Account<'info, TokenAccount>,
 
+    /// Holder's SOL wallet — receives the claimable lamports.
+    #[account(mut)]
     pub holder: Signer<'info>,
-    pub token_program: Program<'info, Token>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

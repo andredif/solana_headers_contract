@@ -37,13 +37,16 @@ RENT_SYSVAR_ID = Pubkey.from_string("SysvarRent111111111111111111111111111111111
 
 PRECISION = 1_000_000_000_000
 SUPPLY    = 1_000_000
-PAYMENT   = 1_000
+# PAYMENT must exceed the rent-exempt minimum for a 0-byte account (~890_880
+# lamports on localnet). The fee vault is created on first SOL deposit, so the
+# deposit amount itself must satisfy rent-exemption.
+PAYMENT   = 2_000_000  # 0.002 SOL — comfortably above rent-exempt minimum
 
-# 80 / 15 / 5 split on PAYMENT = 1000
-EXPECTED_RECIPIENT   = 800   # 80 % — claimable by recipient via claim_recipient_fee
-EXPECTED_GOV_FEE     = 150   # 15 % — released to accumulator on finalize_rent
-EXPECTED_OWNER_FEE   = 50    #  5 % — claimable by owner via claim_owner_fee
-EXPECTED_VAULT_TOTAL = 1000  # 100 % locked in vault on rent_space (refunded on revert/revoke)
+# 80 / 15 / 5 split on PAYMENT = 2_000_000
+EXPECTED_RECIPIENT   = 1_600_000  # 80 % — claimable by recipient via claim_recipient_fee
+EXPECTED_GOV_FEE     =   300_000  # 15 % — released to accumulator on finalize_rent
+EXPECTED_OWNER_FEE   =   100_000  #  5 % — claimable by owner via claim_owner_fee
+EXPECTED_VAULT_TOTAL = 2_000_000  # 100 % locked in vault on rent_space (refunded on revert/revoke)
 
 # RentDuration enum variants — use proper sumtype instances for borsh_construct
 _RentDuration  = _make_enum("Day", "Week", "Month", "Short", name="RentDuration")
@@ -52,11 +55,11 @@ DURATION_WEEK  = _RentDuration.Week()
 DURATION_MONTH = _RentDuration.Month()
 DURATION_SHORT = _RentDuration.Short()   # 10 s — for tests that need expiry
 
-# After finalising one rent with governance_fee = 150 and SUPPLY = 1_000_000:
-#   delta     = (150 * PRECISION) / SUPPLY        = 150_000_000
-#   claimable = (SUPPLY * delta)  / PRECISION     = 150
-EXPECTED_HOLDER_CLAIM = 150
-EXPECTED_OWNER_CLAIM  = 50
+# After finalising one rent with governance_fee = 300_000 and SUPPLY = 1_000_000:
+#   delta     = (300_000 * PRECISION) / SUPPLY        = 300_000_000_000
+#   claimable = (holder_tokens * delta) / PRECISION   = 300_000
+EXPECTED_HOLDER_CLAIM = 300_000
+EXPECTED_OWNER_CLAIM  = 100_000
 
 # Short-duration expiry wait (must be > RentDuration::Short = 10 s)
 SHORT_EXPIRY_WAIT = 15   # seconds
@@ -212,6 +215,12 @@ async def get_token_balance(provider: Provider, ata: Pubkey) -> int:
     return int(resp.value.amount)
 
 
+async def get_sol_balance(provider: Provider, pubkey: Pubkey) -> int:
+    """Return SOL balance of any account in lamports."""
+    resp = await provider.connection.get_balance(pubkey)
+    return resp.value
+
+
 def fee_record_pda(program: Program, payer_pubkey: Pubkey, index: int) -> Pubkey:
     pda, _ = Pubkey.find_program_address(
         [b"fee_record", bytes(payer_pubkey), struct.pack("<Q", index)],
@@ -270,10 +279,8 @@ async def create_rent(
                 "contract":              pdas["contract"],
                 "governance_token_mint": mint,
                 "payer":                 payer.pubkey(),
-                "payer_token_account":   token_accounts["payer"],
                 "fee_vault":             pdas["fee_vault"],
                 "fee_record":            fr_pda,
-                "token_program":         TOKEN_PROGRAM_ID,
                 "system_program":        SYS_PROGRAM_ID,
             },
             signers=[payer],
@@ -341,9 +348,7 @@ async def test_initialize(
                     "governance_token_mint": mint,
                     "fee_vault":             pdas["fee_vault"],
                     "signer":                payer.pubkey(),
-                    "token_program":         TOKEN_PROGRAM_ID,
                     "system_program":        SYS_PROGRAM_ID,
-                    "rent":                  RENT_SYSVAR_ID,
                 },
                 signers=[payer],
             ),
@@ -433,13 +438,13 @@ async def test_rent_space_correct_split(
     after the rental is Completed.
     Creates rent[base_count+0] (Day duration, Pending).
     """
-    vault_before = await get_token_balance(provider, pdas["fee_vault"])
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     fr_pda, _ = await create_rent(
         program, payer, recipient, mint, pdas, token_accounts,
     )
 
-    vault_after = await get_token_balance(provider, pdas["fee_vault"])
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
 
     assert vault_after - vault_before == EXPECTED_VAULT_TOTAL, "100 % not locked in vault"
 
@@ -515,7 +520,6 @@ async def test_finalize_before_expiry_fails(
             ctx=Context(
                 accounts={
                     "contract":   pdas["contract"],
-                    "fee_vault":  pdas["fee_vault"],
                     "fee_record": fr_pda,
                     "caller":     payer.pubkey(),
                 },
@@ -548,7 +552,6 @@ async def test_finalize_rent_succeeds(
         ctx=Context(
             accounts={
                 "contract":   pdas["contract"],
-                "fee_vault":  pdas["fee_vault"],
                 "fee_record": fr_pda,
                 "caller":     payer.pubkey(),
             },
@@ -581,28 +584,27 @@ async def test_claim_recipient_fee_succeeds(
 ):
     """
     Recipient claims their 80 % share from finalized rent[base_count+1].
-    Vault releases EXPECTED_RECIPIENT (800) tokens to the recipient ATA.
+    Vault releases EXPECTED_RECIPIENT (800) lamports to the recipient.
     """
-    fr_pda          = fee_record_pda(program, payer.pubkey(), base_count + 1)
-    rec_before      = await get_token_balance(provider, token_accounts["recipient"])
+    fr_pda     = fee_record_pda(program, payer.pubkey(), base_count + 1)
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     await program.rpc["claim_recipient_fee"](
         ctx=Context(
             accounts={
-                "contract":                pdas["contract"],
-                "fee_vault":               pdas["fee_vault"],
-                "fee_record":              fr_pda,
-                "recipient":               recipient.pubkey(),
-                "recipient_token_account": token_accounts["recipient"],
-                "token_program":           TOKEN_PROGRAM_ID,
+                "contract":   pdas["contract"],
+                "fee_vault":  pdas["fee_vault"],
+                "fee_record": fr_pda,
+                "recipient":  recipient.pubkey(),
+                "system_program": SYS_PROGRAM_ID,
             },
             signers=[recipient],
         ),
     )
 
-    rec_after = await get_token_balance(provider, token_accounts["recipient"])
-    assert rec_after - rec_before == EXPECTED_RECIPIENT, \
-        f"Expected {EXPECTED_RECIPIENT} tokens to recipient, got {rec_after - rec_before}"
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
+    assert vault_before - vault_after == EXPECTED_RECIPIENT, \
+        f"Expected vault to decrease by {EXPECTED_RECIPIENT} lamports, got {vault_before - vault_after}"
 
     fee_rec = await program.account["FeeRecord"].fetch(fr_pda)
     assert fee_rec.recipient_fee_claimed is True
@@ -623,7 +625,6 @@ async def test_cannot_finalize_twice(
             ctx=Context(
                 accounts={
                     "contract":   pdas["contract"],
-                    "fee_vault":  pdas["fee_vault"],
                     "fee_record": fr_pda,
                     "caller":     payer.pubkey(),
                 },
@@ -650,8 +651,8 @@ async def test_claim_fees_after_finalize(
     With SUPPLY = 1_000_000 tokens and governance_fee = 150:
       claimable = (1_000_000 * delta) / PRECISION = 150
     """
-    hs_pda        = holder_state_pda(program, holder.pubkey())
-    holder_before = await get_token_balance(provider, token_accounts["holder"])
+    hs_pda       = holder_state_pda(program, holder.pubkey())
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     await program.rpc["claim_fees"](
         ctx=Context(
@@ -661,14 +662,14 @@ async def test_claim_fees_after_finalize(
                 "holder_state":         hs_pda,
                 "holder_token_account": token_accounts["holder"],
                 "holder":               holder.pubkey(),
-                "token_program":        TOKEN_PROGRAM_ID,
+                "system_program":       SYS_PROGRAM_ID,
             },
             signers=[holder],
         ),
     )
 
-    holder_after = await get_token_balance(provider, token_accounts["holder"])
-    claimed      = holder_after - holder_before
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
+    claimed     = vault_before - vault_after
     assert claimed == EXPECTED_HOLDER_CLAIM, f"Expected {EXPECTED_HOLDER_CLAIM}, got {claimed}"
 
     hs = await program.account["HolderState"].fetch(hs_pda)
@@ -694,7 +695,7 @@ async def test_cannot_double_claim_holder(
                     "holder_state":         hs_pda,
                     "holder_token_account": token_accounts["holder"],
                     "holder":               holder.pubkey(),
-                    "token_program":        TOKEN_PROGRAM_ID,
+                    "system_program":       SYS_PROGRAM_ID,
                 },
                 signers=[holder],
             ),
@@ -721,12 +722,11 @@ async def test_claim_owner_fee_before_finalize_fails(
         await program.rpc["claim_owner_fee"](
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "owner":               payer.pubkey(),
-                    "owner_token_account": token_accounts["owner"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "owner":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -744,24 +744,23 @@ async def test_claim_owner_fee_success(
 ):
     """Owner withdraws the 5 % fee from finalized rent[1]."""
     fr_pda       = fee_record_pda(program, payer.pubkey(), base_count + 1)
-    owner_before = await get_token_balance(provider, token_accounts["owner"])
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     await program.rpc["claim_owner_fee"](
         ctx=Context(
             accounts={
-                "contract":            pdas["contract"],
-                "fee_vault":           pdas["fee_vault"],
-                "fee_record":          fr_pda,
-                "owner":               payer.pubkey(),
-                "owner_token_account": token_accounts["owner"],
-                "token_program":       TOKEN_PROGRAM_ID,
+                "contract":   pdas["contract"],
+                "fee_vault":  pdas["fee_vault"],
+                "fee_record": fr_pda,
+                "owner":      payer.pubkey(),
+                "system_program": SYS_PROGRAM_ID,
             },
             signers=[payer],
         ),
     )
 
-    owner_after = await get_token_balance(provider, token_accounts["owner"])
-    claimed     = owner_after - owner_before
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
+    claimed     = vault_before - vault_after
     assert claimed == EXPECTED_OWNER_CLAIM, f"Expected {EXPECTED_OWNER_CLAIM}, got {claimed}"
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
@@ -783,12 +782,11 @@ async def test_cannot_double_claim_owner_fee(
         await program.rpc["claim_owner_fee"](
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "owner":               payer.pubkey(),
-                    "owner_token_account": token_accounts["owner"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "owner":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -816,12 +814,12 @@ async def test_revert_rent_unauthorized(
         await program.rpc["revert_rent"](
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "authority":           holder.pubkey(),
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "authority":  holder.pubkey(),
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[holder],
             ),
@@ -842,26 +840,26 @@ async def test_revert_rent_by_payer(
     The full 100 % (PAYMENT) is returned to the payer.
     """
     fr_pda       = fee_record_pda(program, payer.pubkey(), base_count + 0)
-    payer_before = await get_token_balance(provider, token_accounts["payer"])
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     await program.rpc["revert_rent"](
         ctx=Context(
             accounts={
-                "contract":            pdas["contract"],
-                "fee_vault":           pdas["fee_vault"],
-                "fee_record":          fr_pda,
-                "authority":           payer.pubkey(),
-                "payer_token_account": token_accounts["payer"],
-                "token_program":       TOKEN_PROGRAM_ID,
+                "contract":   pdas["contract"],
+                "fee_vault":  pdas["fee_vault"],
+                "fee_record": fr_pda,
+                "authority":  payer.pubkey(),
+                "payer":      payer.pubkey(),
+                "system_program": SYS_PROGRAM_ID,
             },
             signers=[payer],
         ),
     )
 
-    payer_after = await get_token_balance(provider, token_accounts["payer"])
-    refund      = payer_after - payer_before
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
+    refund      = vault_before - vault_after
     assert refund == PAYMENT, \
-        f"Expected 100 % refund of {PAYMENT}, got {refund}"
+        f"Expected 100 % refund of {PAYMENT} lamports from vault, got {refund}"
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
     assert rec.status == 3, "status must be Reverted (3)"
@@ -882,12 +880,12 @@ async def test_cannot_revert_twice(
         await program.rpc["revert_rent"](
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "authority":           payer.pubkey(),
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "authority":  payer.pubkey(),
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -911,7 +909,6 @@ async def test_cannot_finalize_reverted_rent(
             ctx=Context(
                 accounts={
                     "contract":   pdas["contract"],
-                    "fee_vault":  pdas["fee_vault"],
                     "fee_record": fr_pda,
                     "caller":     payer.pubkey(),
                 },
@@ -950,12 +947,12 @@ async def test_revoke_by_oracle_wrong_key(
             "header_image_changed",
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "oracle":              holder.pubkey(),   # wrong key
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "oracle":     holder.pubkey(),   # wrong key
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[holder],
             ),
@@ -974,27 +971,27 @@ async def test_revoke_by_oracle_success(
 ):
     """Oracle revokes rent[base_count+2] (Pending) — payer gets 100 % refund."""
     fr_pda       = fee_record_pda(program, payer.pubkey(), base_count + 2)
-    payer_before = await get_token_balance(provider, token_accounts["payer"])
+    vault_before = await get_sol_balance(provider, pdas["fee_vault"])
 
     await program.rpc["revoke_by_oracle"](
         "header_image_changed",
         ctx=Context(
             accounts={
-                "contract":            pdas["contract"],
-                "fee_vault":           pdas["fee_vault"],
-                "fee_record":          fr_pda,
-                "oracle":              oracle.pubkey(),
-                "payer_token_account": token_accounts["payer"],
-                "token_program":       TOKEN_PROGRAM_ID,
+                "contract":   pdas["contract"],
+                "fee_vault":  pdas["fee_vault"],
+                "fee_record": fr_pda,
+                "oracle":     oracle.pubkey(),
+                "payer":      payer.pubkey(),
+                "system_program": SYS_PROGRAM_ID,
             },
             signers=[oracle],
         ),
     )
 
-    payer_after = await get_token_balance(provider, token_accounts["payer"])
-    refund      = payer_after - payer_before
+    vault_after = await get_sol_balance(provider, pdas["fee_vault"])
+    refund      = vault_before - vault_after
     assert refund == PAYMENT, \
-        f"Expected 100 % refund {PAYMENT}, got {refund}"
+        f"Expected 100 % refund {PAYMENT} from vault, got {refund}"
 
     rec = await program.account["FeeRecord"].fetch(fr_pda)
     assert rec.status == 4, "status must be Revoked (4)"
@@ -1017,12 +1014,12 @@ async def test_cannot_revoke_already_reverted(
             "duplicate",
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "oracle":              oracle.pubkey(),
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "oracle":     oracle.pubkey(),
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[oracle],
             ),
@@ -1046,12 +1043,12 @@ async def test_oracle_cannot_revoke_finalized(
             "too late",
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "oracle":              oracle.pubkey(),
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "oracle":     oracle.pubkey(),
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[oracle],
             ),
@@ -1093,7 +1090,7 @@ async def test_update_oracle_authorized(
     """Owner can rotate the oracle keypair; state is updated and then restored."""
     new_oracle = Keypair()
 
-    await program.rpc["update_oracle"](
+    sig = await program.rpc["update_oracle"](
         new_oracle.pubkey(),
         ctx=Context(
             accounts={
@@ -1103,11 +1100,12 @@ async def test_update_oracle_authorized(
             signers=[payer],
         ),
     )
+    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.oracle == new_oracle.pubkey()
 
     # Restore so remaining tests are not affected
-    await program.rpc["update_oracle"](
+    sig = await program.rpc["update_oracle"](
         oracle.pubkey(),
         ctx=Context(
             accounts={
@@ -1117,6 +1115,7 @@ async def test_update_oracle_authorized(
             signers=[payer],
         ),
     )
+    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.oracle == oracle.pubkey()
 
@@ -1155,7 +1154,7 @@ async def test_update_owner_authorized(
     """Owner can transfer ownership; state is updated and then restored."""
     new_owner = Keypair()
 
-    await program.rpc["update_owner"](
+    sig = await program.rpc["update_owner"](
         new_owner.pubkey(),
         ctx=Context(
             accounts={
@@ -1165,10 +1164,11 @@ async def test_update_owner_authorized(
             signers=[payer],
         ),
     )
+    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.owner == new_owner.pubkey()
 
-    await program.rpc["update_owner"](
+    sig = await program.rpc["update_owner"](
         payer.pubkey(),
         ctx=Context(
             accounts={
@@ -1178,6 +1178,7 @@ async def test_update_owner_authorized(
             signers=[new_owner],
         ),
     )
+    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.owner == payer.pubkey()
 
@@ -1232,12 +1233,12 @@ async def test_revert_active_rent_fails(
         await program.rpc["revert_rent"](
             ctx=Context(
                 accounts={
-                    "contract":            pdas["contract"],
-                    "fee_vault":           pdas["fee_vault"],
-                    "fee_record":          fr_pda,
-                    "authority":           payer.pubkey(),
-                    "payer_token_account": token_accounts["payer"],
-                    "token_program":       TOKEN_PROGRAM_ID,
+                    "contract":   pdas["contract"],
+                    "fee_vault":  pdas["fee_vault"],
+                    "fee_record": fr_pda,
+                    "authority":  payer.pubkey(),
+                    "payer":      payer.pubkey(),
+                    "system_program": SYS_PROGRAM_ID,
                 },
                 signers=[payer],
             ),
@@ -1267,10 +1268,8 @@ async def test_rent_space_zero_payment(
                     "contract":              pdas["contract"],
                     "governance_token_mint": mint,
                     "payer":                 payer.pubkey(),
-                    "payer_token_account":   token_accounts["payer"],
                     "fee_vault":             pdas["fee_vault"],
                     "fee_record":            fr_pda,
-                    "token_program":         TOKEN_PROGRAM_ID,
                     "system_program":        SYS_PROGRAM_ID,
                 },
                 signers=[payer],
@@ -1322,7 +1321,6 @@ async def test_accumulator_grows_across_multiple_finalizations(
             ctx=Context(
                 accounts={
                     "contract":   pdas["contract"],
-                    "fee_vault":  pdas["fee_vault"],
                     "fee_record": fr_pda,
                     "caller":     payer.pubkey(),
                 },
