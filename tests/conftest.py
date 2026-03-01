@@ -21,6 +21,7 @@ older v1 format.  ``_convert_idl_v2_to_v1()`` bridges the gap.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -37,7 +38,22 @@ _DEPLOY_KP   = _ROOT / "target" / "deploy" / "fee_distribution-keypair.json"
 _SO_FILE     = _ROOT / "target" / "deploy" / "fee_distribution.so"
 _IDL_FILE    = _ROOT / "target" / "idl"    / "fee_distribution.json"
 _WALLET_FILE = _ROOT / "id.json"
-_RPC_URL     = "http://localhost:8899"
+
+# Network selection — override with:  SOLANA_RPC_URL=https://api.devnet.solana.com pytest ...
+_NETWORK_PRESETS = {
+    "localnet": "http://localhost:8899",
+    "devnet":   "https://api.devnet.solana.com",
+    "testnet":  "https://api.testnet.solana.com",
+    "mainnet":  "https://api.mainnet-beta.solana.com",
+}
+_RPC_URL = os.environ.get(
+    "SOLANA_RPC_URL",
+    _NETWORK_PRESETS.get(os.environ.get("SOLANA_NETWORK", "localnet"), "http://localhost:8899"),
+)
+print(f"[conftest] Using RPC: {_RPC_URL}")
+
+# Devnet faucet caps single requests at 2 SOL; localnet has no limit.
+_AIRDROP_AMOUNT = 2_000_000_000 if "devnet" in _RPC_URL or "testnet" in _RPC_URL else 10_000_000_000
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,14 +190,14 @@ def _program_info():
     print(f"[setup] Program ID: {program_id}")
 
     # ── 3. Deploy ─────────────────────────────────────────────────────────────
-    print("[setup] Deploying to localnet …")
+    print(f"[setup] Deploying to {_RPC_URL} …")
     deploy = subprocess.run(
         [
             "solana", "program", "deploy",
             str(_SO_FILE),
             "--program-id", str(_DEPLOY_KP),
-            "--url",         _RPC_URL,
-            "--keypair",     str(_WALLET_FILE),
+            "--url",        _RPC_URL,
+            "--keypair",    str(_WALLET_FILE),
         ],
         cwd=_ROOT,
         capture_output=True,
@@ -225,12 +241,14 @@ async def workspace(_program_info):
     client = AsyncClient(_RPC_URL, commitment=Confirmed)
 
     # Airdrop so there is plenty of SOL for all transactions in this module.
+    # On devnet/testnet the faucet caps each request at 2 SOL.
     try:
-        resp = await client.request_airdrop(wallet_keypair.pubkey(), 10_000_000_000)
+        resp = await client.request_airdrop(wallet_keypair.pubkey(), _AIRDROP_AMOUNT)
         await client.confirm_transaction(resp.value, commitment=Confirmed)
-        print(f"\n[workspace] Airdropped 10 SOL to {wallet_keypair.pubkey()}")
+        sol = _AIRDROP_AMOUNT / 1e9
+        print(f"\n[workspace] Airdropped {sol} SOL to {wallet_keypair.pubkey()}")
     except Exception as exc:
-        print(f"\n[workspace] Airdrop skipped: {exc}")
+        print(f"\n[workspace] Airdrop skipped (fund wallet manually on devnet): {exc}")
 
     provider = Provider(client, Wallet(wallet_keypair))
     program  = Program(idl, program_id, provider)
