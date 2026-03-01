@@ -37,16 +37,19 @@ RENT_SYSVAR_ID = Pubkey.from_string("SysvarRent111111111111111111111111111111111
 
 PRECISION = 1_000_000_000_000
 SUPPLY    = 1_000_000
-# PAYMENT must exceed the rent-exempt minimum for a 0-byte account (~890_880
-# lamports on localnet). The fee vault is created on first SOL deposit, so the
-# deposit amount itself must satisfy rent-exemption.
-PAYMENT   = 2_000_000  # 0.002 SOL — comfortably above rent-exempt minimum
+# PAYMENT must satisfy two constraints:
+#   1. The fee vault receives this amount on first deposit, so it must exceed
+#      the rent-exempt minimum for a 0-byte system-owned account (~890_880 lamports).
+#   2. The vault must not fall below rent-exempt after partial claims if any
+#      owner-gated instruction fails (worst case: owner_fee = 5% remains).
+#      Safety margin: 5% * PAYMENT ≥ 890_880  →  PAYMENT ≥ ~17.8M
+PAYMENT   = 20_000_000  # 0.02 SOL
 
-# 80 / 15 / 5 split on PAYMENT = 2_000_000
-EXPECTED_RECIPIENT   = 1_600_000  # 80 % — claimable by recipient via claim_recipient_fee
-EXPECTED_GOV_FEE     =   300_000  # 15 % — released to accumulator on finalize_rent
-EXPECTED_OWNER_FEE   =   100_000  #  5 % — claimable by owner via claim_owner_fee
-EXPECTED_VAULT_TOTAL = 2_000_000  # 100 % locked in vault on rent_space (refunded on revert/revoke)
+# 80 / 15 / 5 split on PAYMENT = 20_000_000
+EXPECTED_RECIPIENT   = 16_000_000  # 80 % — claimable by recipient via claim_recipient_fee
+EXPECTED_GOV_FEE     =  3_000_000  # 15 % — released to accumulator on finalize_rent
+EXPECTED_OWNER_FEE   =  1_000_000  #  5 % — claimable by owner via claim_owner_fee
+EXPECTED_VAULT_TOTAL = 20_000_000  # 100 % locked in vault on rent_space (refunded on revert/revoke)
 
 # RentDuration enum variants — use proper sumtype instances for borsh_construct
 _RentDuration  = _make_enum("Day", "Week", "Month", "Short", name="RentDuration")
@@ -55,11 +58,12 @@ DURATION_WEEK  = _RentDuration.Week()
 DURATION_MONTH = _RentDuration.Month()
 DURATION_SHORT = _RentDuration.Short()   # 10 s — for tests that need expiry
 
-# After finalising one rent with governance_fee = 300_000 and SUPPLY = 1_000_000:
-#   delta     = (300_000 * PRECISION) / SUPPLY        = 300_000_000_000
-#   claimable = (holder_tokens * delta) / PRECISION   = 300_000
-EXPECTED_HOLDER_CLAIM = 300_000
-EXPECTED_OWNER_CLAIM  = 100_000
+# After finalising one rent with governance_fee = 3_000_000 and SUPPLY = 1_000_000:
+#   delta     = (3_000_000 * PRECISION) / SUPPLY          = 3_000_000_000_000
+#   claimable = (holder_tokens * delta) / PRECISION       = 3_000_000
+# (holder holds all SUPPLY tokens, so claimable == governance_fee)
+EXPECTED_HOLDER_CLAIM = 3_000_000
+EXPECTED_OWNER_CLAIM  = 1_000_000
 
 # Short-duration expiry wait (must be > RentDuration::Short = 10 s)
 SHORT_EXPIRY_WAIT = 15   # seconds
@@ -1104,20 +1108,23 @@ async def test_update_oracle_authorized(
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.oracle == new_oracle.pubkey()
 
-    # Restore so remaining tests are not affected
-    sig = await program.rpc["update_oracle"](
-        oracle.pubkey(),
-        ctx=Context(
-            accounts={
-                "contract": pdas["contract"],
-                "owner":    payer.pubkey(),
-            },
-            signers=[payer],
-        ),
-    )
-    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
-    state = await program.account["ContractState"].fetch(pdas["contract"])
-    assert state.oracle == oracle.pubkey()
+    # Restore original oracle — always done so the contract is not left with
+    # a random oracle that would break subsequent tests and future runs.
+    try:
+        sig = await program.rpc["update_oracle"](
+            oracle.pubkey(),
+            ctx=Context(
+                accounts={
+                    "contract": pdas["contract"],
+                    "owner":    payer.pubkey(),
+                },
+                signers=[payer],
+            ),
+        )
+        await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
+    finally:
+        state = await program.account["ContractState"].fetch(pdas["contract"])
+        assert state.oracle == oracle.pubkey()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1168,19 +1175,23 @@ async def test_update_owner_authorized(
     state = await program.account["ContractState"].fetch(pdas["contract"])
     assert state.owner == new_owner.pubkey()
 
-    sig = await program.rpc["update_owner"](
-        payer.pubkey(),
-        ctx=Context(
-            accounts={
-                "contract": pdas["contract"],
-                "owner":    new_owner.pubkey(),
-            },
-            signers=[new_owner],
-        ),
-    )
-    await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
-    state = await program.account["ContractState"].fetch(pdas["contract"])
-    assert state.owner == payer.pubkey()
+    # Restore ownership — always done so the contract is not left with a random
+    # owner that would break subsequent tests and future runs on the same validator.
+    try:
+        sig = await program.rpc["update_owner"](
+            payer.pubkey(),
+            ctx=Context(
+                accounts={
+                    "contract": pdas["contract"],
+                    "owner":    new_owner.pubkey(),
+                },
+                signers=[new_owner],
+            ),
+        )
+        await program.provider.connection.confirm_transaction(sig, commitment=Confirmed)
+    finally:
+        state = await program.account["ContractState"].fetch(pdas["contract"])
+        assert state.owner == payer.pubkey()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1217,17 +1228,29 @@ async def test_update_supply_snapshot_unauthorized(
 @pytest.mark.asyncio
 async def test_revert_active_rent_fails(
     program: Program,
+    provider: Provider,
     payer: Keypair,
+    recipient: Keypair,
+    mint: Pubkey,
     pdas: dict,
     token_accounts: dict,
-    base_count: int,
 ):
     """
-    Attempting to revert a non-Pending record (rent[base_count+2], Revoked)
-    must raise RentNotPending.
-    (Previously tested PaymentExpired which no longer exists in the contract.)
+    Reverting an Active rent must raise RentNotPending.
+
+    Creates a fresh Short-duration rent, activates it (status → Active), then
+    immediately tries to revert. The contract only allows revert_rent on Pending
+    records, so this must fail with 'Rental must be in Pending status'.
+
+    This test is intentionally self-contained: it does not depend on the outcome
+    of the revoke_by_oracle tests (which use different rent records).
     """
-    fr_pda = fee_record_pda(program, payer.pubkey(), base_count + 2)
+    fr_pda, _ = await create_rent(
+        program, payer, recipient, mint, pdas, token_accounts,
+        duration=DURATION_SHORT,
+    )
+    # Activate → status = Active (no longer Pending, so revert must fail)
+    await activate_rent_rpc(program, provider, recipient, fr_pda, pdas)
 
     with pytest.raises(Exception, match="Rental must be in Pending status"):
         await program.rpc["revert_rent"](
