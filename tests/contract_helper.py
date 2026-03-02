@@ -617,35 +617,30 @@ class ContractInteractor:
 
     def create_claim_owner_fee_instruction(
         self,
-        payer: Pubkey,
-        fee_record_index: int,
         owner: Pubkey,
-        owner_token_account: Pubkey
     ) -> Instruction:
         """
-        Create instruction for the contract owner to claim their 5 % fee
-        from a finalized rental record.
+        Create instruction for the contract owner to sweep all accumulated
+        5 % fees in a single transaction.
+
+        The amount claimable is derived on-chain from
+        ``owner_fees_accumulated - owner_fees_claimed``; no fee record or
+        index is required.
 
         Args:
-            payer: Original payer pubkey (used for fee record PDA derivation)
-            fee_record_index: Index of the fee record
-            owner: Contract owner signer
-            owner_token_account: Owner's token account that receives the fee
+            owner: Contract owner signer (must match contract.owner).
 
         Returns:
             Instruction for claim_owner_fee
         """
         contract_pubkey, _ = self.get_contract_pda()
         fee_vault_pubkey, _ = self.get_fee_vault_pda(contract_pubkey)
-        fee_record_pubkey, _ = self.get_fee_record_pda(payer, fee_record_index)
 
         accounts = [
-            AccountMeta(pubkey=contract_pubkey,     is_signer=False, is_writable=False),
-            AccountMeta(pubkey=fee_vault_pubkey,    is_signer=False, is_writable=True),
-            AccountMeta(pubkey=fee_record_pubkey,   is_signer=False, is_writable=True),
-            AccountMeta(pubkey=owner,               is_signer=True,  is_writable=False),
-            AccountMeta(pubkey=owner_token_account, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=contract_pubkey,                          is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_vault_pubkey,                         is_signer=False, is_writable=True),
+            AccountMeta(pubkey=owner,                                    is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(self.SYSTEM_PROGRAM),  is_signer=False, is_writable=False),
         ]
 
         return Instruction(

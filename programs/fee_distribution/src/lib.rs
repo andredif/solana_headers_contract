@@ -7,8 +7,8 @@ declare_id!("6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm");
 const PRECISION: u128 = 1_000_000_000_000;
 
 // Hardcoded space constants (8 = Anchor discriminator)
-// ContractState: 32 + 32 + 32 + 1 + 1 + 16 + 8 + 8 + 8 = 138
-const CONTRACT_STATE_SPACE: usize = 8 + 138;
+// ContractState: 32 + 32 + 32 + 1 + 1 + 16 + 8 + 8 + 8 + 8 + 8 = 154
+const CONTRACT_STATE_SPACE: usize = 8 + 154;
 // FeeRecord (new layout): 32+32+32 + 1+1 + 8+8 + 8+8+8+8 + 8+8 + 1+1 = 164, padded to 168
 const FEE_RECORD_SPACE: usize = 8 + 168;
 // HolderState: 32 + 16 + 8 = 56
@@ -84,6 +84,8 @@ pub mod fee_distribution {
         contract.total_fees_accumulated = 0;
         contract.fee_record_count = 0;
         contract.supply_snapshot = supply_snapshot;
+        contract.owner_fees_accumulated = 0;
+        contract.owner_fees_claimed = 0;
 
         Ok(())
     }
@@ -296,6 +298,12 @@ pub mod fee_distribution {
             .checked_add(governance_fee)
             .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
+        contract.owner_fees_accumulated = contract
+            .owner_fees_accumulated
+            .checked_add(fee_record.owner_fee)
+            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+        fee_record.owner_fee_claimed = true; // owner_fee released to accumulator
         fee_record.status = RentStatus::Completed as u8;
 
         emit!(FinalizeRentEvent {
@@ -311,27 +319,79 @@ pub mod fee_distribution {
         Ok(())
     }
 
-    /// Recipient (loaner / profile owner) withdraws their 80% share after
-    /// the rental has reached Completed status.
+    /// Recipient (loaner / profile owner) withdraws their 80% share.
+    ///
+    /// Embeds a lazy-finalize: if the rental is still Active and has expired,
+    /// this instruction finalizes it inline (updates governance + owner
+    /// accumulators) so the recipient never needs to call ``finalize_rent``
+    /// as a separate step.
     pub fn claim_recipient_fee(ctx: Context<ClaimRecipientFee>) -> Result<()> {
-        let fee_record = &mut ctx.accounts.fee_record;
+        let now = Clock::get()?.unix_timestamp;
 
-        require!(
-            fee_record.status == RentStatus::Completed as u8,
-            FeeDistributionError::RentNotCompleted
-        );
-        require!(!fee_record.recipient_fee_claimed, FeeDistributionError::RecipientFeeAlreadyClaimed);
+        // ── Lazy-finalize (Active + expired) ───────────────────────────────────────
+        if ctx.accounts.fee_record.status == RentStatus::Active as u8 {
+            require!(
+                now >= ctx.accounts.fee_record.expiration_time,
+                FeeDistributionError::RentNotExpired
+            );
+
+            let governance_fee = ctx.accounts.fee_record.governance_fee;
+            let owner_fee      = ctx.accounts.fee_record.owner_fee;
+            let supply         = ctx.accounts.contract.supply_snapshot;
+
+            let fees_per_token_delta = (governance_fee as u128)
+                .checked_mul(PRECISION)
+                .ok_or(FeeDistributionError::ArithmeticOverflow)?
+                .checked_div(supply as u128)
+                .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+            ctx.accounts.contract.fees_per_token_accumulated = ctx.accounts.contract
+                .fees_per_token_accumulated
+                .checked_add(fees_per_token_delta)
+                .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+            ctx.accounts.contract.total_fees_accumulated = ctx.accounts.contract
+                .total_fees_accumulated
+                .checked_add(governance_fee)
+                .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+            ctx.accounts.contract.owner_fees_accumulated = ctx.accounts.contract
+                .owner_fees_accumulated
+                .checked_add(owner_fee)
+                .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+            ctx.accounts.fee_record.owner_fee_claimed = true;
+            ctx.accounts.fee_record.status = RentStatus::Completed as u8;
+
+            emit!(FinalizeRentEvent {
+                payer:         ctx.accounts.fee_record.payer,
+                recipient:     ctx.accounts.fee_record.recipient,
+                index:         ctx.accounts.fee_record.index,
+                governance_fee,
+                owner_fee,
+                recipient_fee: ctx.accounts.fee_record.recipient_fee,
+                timestamp:     now,
+            });
+        } else {
+            require!(
+                ctx.accounts.fee_record.status == RentStatus::Completed as u8,
+                FeeDistributionError::RentNotCompleted
+            );
+        }
+
+        // ── Claim 80% ─────────────────────────────────────────────────────────────
+        require!(!ctx.accounts.fee_record.recipient_fee_claimed, FeeDistributionError::RecipientFeeAlreadyClaimed);
         require_eq!(
             ctx.accounts.recipient.key(),
-            fee_record.recipient,
+            ctx.accounts.fee_record.recipient,
             FeeDistributionError::UnauthorizedRecipient
         );
 
-        let recipient_fee = fee_record.recipient_fee;
+        let recipient_fee = ctx.accounts.fee_record.recipient_fee;
         require!(recipient_fee > 0, FeeDistributionError::NothingToClaim);
 
         let contract_key = ctx.accounts.contract.key();
-        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let vault_bump   = ctx.accounts.contract.fee_vault_bump;
         let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
@@ -340,46 +400,47 @@ pub mod fee_distribution {
                 ctx.accounts.system_program.to_account_info(),
                 SolTransfer {
                     from: ctx.accounts.fee_vault.to_account_info(),
-                    to: ctx.accounts.recipient.to_account_info(),
+                    to:   ctx.accounts.recipient.to_account_info(),
                 },
                 signer_seeds,
             ),
             recipient_fee,
         )?;
 
-        fee_record.recipient_fee_claimed = true;
+        ctx.accounts.fee_record.recipient_fee_claimed = true;
 
         emit!(ClaimRecipientFeeEvent {
             recipient: ctx.accounts.recipient.key(),
-            payer: fee_record.payer,
-            index: fee_record.index,
-            amount: recipient_fee,
-            timestamp: Clock::get()?.unix_timestamp,
+            payer:     ctx.accounts.fee_record.payer,
+            index:     ctx.accounts.fee_record.index,
+            amount:    recipient_fee,
+            timestamp: now,
         });
 
         Ok(())
     }
 
-    /// Contract owner withdraws their 5% share from a Completed rental record.
+    /// Contract owner sweeps all accumulated 5% fees in a single transaction.
+    ///
+    /// Fees accumulate in ``ContractState.owner_fees_accumulated`` each time a
+    /// rental is finalized (via ``finalize_rent`` or the lazy-finalize path in
+    /// ``claim_recipient_fee``). One call claims everything accrued since the
+    /// last withdrawal — no per-record iteration needed.
     pub fn claim_owner_fee(ctx: Context<ClaimOwnerFee>) -> Result<()> {
-        let fee_record = &mut ctx.accounts.fee_record;
-
-        require!(
-            fee_record.status == RentStatus::Completed as u8,
-            FeeDistributionError::RentNotCompleted
-        );
-        require!(!fee_record.owner_fee_claimed, FeeDistributionError::OwnerFeeAlreadyClaimed);
         require_eq!(
             ctx.accounts.owner.key(),
             ctx.accounts.contract.owner,
             FeeDistributionError::UnauthorizedOwner
         );
 
-        let owner_fee = fee_record.owner_fee;
-        require!(owner_fee > 0, FeeDistributionError::NothingToClaim);
+        let claimable = ctx.accounts.contract.owner_fees_accumulated
+            .checked_sub(ctx.accounts.contract.owner_fees_claimed)
+            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
+
+        require!(claimable > 0, FeeDistributionError::NothingToClaim);
 
         let contract_key = ctx.accounts.contract.key();
-        let vault_bump = ctx.accounts.contract.fee_vault_bump;
+        let vault_bump   = ctx.accounts.contract.fee_vault_bump;
         let seeds = &[b"fee_vault" as &[u8], contract_key.as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
 
@@ -388,20 +449,20 @@ pub mod fee_distribution {
                 ctx.accounts.system_program.to_account_info(),
                 SolTransfer {
                     from: ctx.accounts.fee_vault.to_account_info(),
-                    to: ctx.accounts.owner.to_account_info(),
+                    to:   ctx.accounts.owner.to_account_info(),
                 },
                 signer_seeds,
             ),
-            owner_fee,
+            claimable,
         )?;
 
-        fee_record.owner_fee_claimed = true;
+        ctx.accounts.contract.owner_fees_claimed = ctx.accounts.contract.owner_fees_claimed
+            .checked_add(claimable)
+            .ok_or(FeeDistributionError::ArithmeticOverflow)?;
 
         emit!(ClaimOwnerFeeEvent {
-            owner: ctx.accounts.owner.key(),
-            payer: fee_record.payer,
-            index: fee_record.index,
-            amount: owner_fee,
+            owner:     ctx.accounts.owner.key(),
+            amount:    claimable,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
@@ -725,7 +786,7 @@ pub struct FinalizeRent<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimRecipientFee<'info> {
-    #[account(seeds = [b"contract"], bump = contract.bump)]
+    #[account(mut, seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
     /// SOL vault—holds all locked payments as lamports.
@@ -756,10 +817,10 @@ pub struct ClaimRecipientFee<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimOwnerFee<'info> {
-    #[account(seeds = [b"contract"], bump = contract.bump)]
+    #[account(mut, seeds = [b"contract"], bump = contract.bump)]
     pub contract: Account<'info, ContractState>,
 
-    /// SOL vault.
+    /// SOL vault — source of the owner sweep.
     #[account(
         mut,
         seeds = [b"fee_vault", contract.key().as_ref()],
@@ -767,18 +828,7 @@ pub struct ClaimOwnerFee<'info> {
     )]
     pub fee_vault: SystemAccount<'info>,
 
-    #[account(
-        mut,
-        seeds = [
-            b"fee_record",
-            fee_record.payer.as_ref(),
-            &fee_record.index.to_le_bytes()
-        ],
-        bump
-    )]
-    pub fee_record: Account<'info, FeeRecord>,
-
-    /// Must match contract.owner.
+    /// Must match contract.owner; verified in instruction logic.
     #[account(mut)]
     pub owner: Signer<'info>,
 
@@ -931,7 +981,9 @@ pub struct ContractState {
     pub total_fees_accumulated: u64,        // 8
     pub fee_record_count: u64,              // 8
     pub supply_snapshot: u64,               // 8
-}                                           // = 138
+    pub owner_fees_accumulated: u64,        // 8  — running total of 5% owner fees released
+    pub owner_fees_claimed: u64,            // 8  — running total of owner fees withdrawn
+}                                           // = 154
 
 #[account]
 pub struct FeeRecord {
@@ -948,7 +1000,7 @@ pub struct FeeRecord {
     pub recipient_fee: u64,          // 8  — 80% claimable by recipient after Completed
     pub timestamp: i64,              // 8  — creation time of this record
     pub index: u64,                  // 8  — sequential index per payer
-    pub owner_fee_claimed: bool,     // 1
+    pub owner_fee_claimed: bool,     // 1  — true once owner_fee is released to the accumulator
     pub recipient_fee_claimed: bool, // 1
 }                                    // = 164 (padded to 168 via FEE_RECORD_SPACE constant)
 
@@ -1013,8 +1065,6 @@ pub struct ClaimRecipientFeeEvent {
 #[event]
 pub struct ClaimOwnerFeeEvent {
     pub owner: Pubkey,
-    pub payer: Pubkey,
-    pub index: u64,
     pub amount: u64,
     pub timestamp: i64,
 }
