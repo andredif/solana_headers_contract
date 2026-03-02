@@ -290,8 +290,6 @@ class ContractInteractor:
         duration: RentDuration,
         payment_amount: int,
         payer: Pubkey,
-        payer_token_account: Pubkey,
-        governance_token_mint: Pubkey,
         fee_record_count: int = 0
     ) -> Instruction:
         """
@@ -302,11 +300,9 @@ class ContractInteractor:
 
         Args:
             recipient: Recipient (profile owner) pubkey
-            duration: RentDuration.Day / Week / Month
-            payment_amount: Amount to lock in token base units
+            duration: RentDuration.Day / Week / Month / Short
+            payment_amount: Amount to lock in lamports (native SOL)
             payer: Payer signer pubkey
-            payer_token_account: Payer's token account (source of funds)
-            governance_token_mint: Governance token mint
             fee_record_count: Current fee record count (for PDA seed derivation)
 
         Returns:
@@ -323,13 +319,10 @@ class ContractInteractor:
         instruction_data += payment_amount.to_bytes(8, byteorder='little')
 
         accounts = [
-            AccountMeta(pubkey=contract_pubkey,       is_signer=False, is_writable=True),
-            AccountMeta(pubkey=governance_token_mint, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=payer,                 is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=payer_token_account,   is_signer=False, is_writable=True),
-            AccountMeta(pubkey=fee_vault_pubkey,      is_signer=False, is_writable=True),
-            AccountMeta(pubkey=fee_record_pubkey,     is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(self.TOKEN_PROGRAM),  is_signer=False, is_writable=False),
+            AccountMeta(pubkey=contract_pubkey,   is_signer=False, is_writable=True),
+            AccountMeta(pubkey=payer,             is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=fee_vault_pubkey,  is_signer=False, is_writable=True),
+            AccountMeta(pubkey=fee_record_pubkey, is_signer=False, is_writable=True),
             AccountMeta(pubkey=Pubkey.from_string(self.SYSTEM_PROGRAM), is_signer=False, is_writable=False),
         ]
 

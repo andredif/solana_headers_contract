@@ -281,7 +281,6 @@ async def create_rent(
         ctx=Context(
             accounts={
                 "contract":              pdas["contract"],
-                "governance_token_mint": mint,
                 "payer":                 payer.pubkey(),
                 "fee_vault":             pdas["fee_vault"],
                 "fee_record":            fr_pda,

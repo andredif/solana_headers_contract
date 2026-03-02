@@ -649,9 +649,8 @@ pub struct RentSpace<'info> {
     )]
     pub contract: Account<'info, ContractState>,
 
-    /// HDRZ governance token mint — referenced by ContractState for holder math.
-    /// Not involved in the SOL payment transfer.
-    pub governance_token_mint: Account<'info, Mint>,
+    // governance_token_mint is NOT passed as an account — it lives inside
+    // ContractState.governance_token_mint and is not needed for rent_space logic.
 
     #[account(mut)]
     pub payer: Signer<'info>,
