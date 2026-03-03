@@ -45,7 +45,7 @@ except ImportError as exc:
 MINT_ADDRESS = "HcVRxQMYM3WtkCmBMXyHyczNwrmEt5hSVn682yrd8ops"
 
 # How many tokens to send to each address
-AMOUNT_PER_RECIPIENT = 10_000
+AMOUNT_PER_RECIPIENT = 490_000
 
 # Recipient wallet addresses (base58).  Add as many as you like.
 RECIPIENTS: list[str] = [
