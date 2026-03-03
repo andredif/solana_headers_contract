@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program::{self, Transfer as SolTransfer};
 use anchor_spl::token::{TokenAccount, Mint};
 
-declare_id!("6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm");
+declare_id!("F9MH5njkqGecTChbv55GMApJNDuoLb8kRqt66sbCnevJ");
 
 const PRECISION: u128 = 1_000_000_000_000;
 

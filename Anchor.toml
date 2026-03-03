@@ -9,7 +9,7 @@ skip-lint = false
 fee_distribution = "6iCBP3de8RKFhUbXVRNvrbV6Ki83JHTmge6tNGvcGiEm"
 
 [programs.devnet]
-fee_distribution = "11111111111111111111111111111111"
+fee_distribution = "F9MH5njkqGecTChbv55GMApJNDuoLb8kRqt66sbCnevJ"
 
 [programs.mainnet]
 fee_distribution = "11111111111111111111111111111111"
